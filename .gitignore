@@ -28,6 +28,7 @@ compile_commands.json
 *.a
 
 # IDE
+.cursor/
 .vscode/
 .idea/
 *.iml
