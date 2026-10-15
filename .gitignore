@@ -1,0 +1,38 @@
+# colcon / ROS 2
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# C/C++ and CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+cmake-build-*/
+compile_commands.json
+*.o
+*.so
+*.a
+
+# IDE
+.vscode/
+.idea/
+*.iml
+*.code-workspace
+*.swp
+*.swo
+*~
+.DS_Store

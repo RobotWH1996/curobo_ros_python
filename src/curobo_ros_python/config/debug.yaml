@@ -1,0 +1,48 @@
+# 仿真 / 真机对着 RViz 调试：可视化 + TrajOpt 下发控制器。MPC 由 /follow_mpc 开关。
+curobo_motion_planning_node:
+  ros__parameters:
+    # --- 机器人 / TrajOpt ---
+    robot: lycus.yml                    # cuRobo 机器人 YAML：lycus.yml / k100.yml
+    scene_model: ""                     # 静态场景 YAML；空则无 cuboid/mesh 障碍（点云仍可单独开）
+    warmup_iterations: 3                # TrajOpt CUDA graph warmup 次数；0 则启动快、第一次规划慢
+    use_cuda_graph: true                # 是否捕获 CUDA graph；关则调试方便、稳态更慢
+    interpolation_dt: 0.1               # 规划轨迹插值步长 (s)补:规划轨迹稠密就减小，规划轨迹稀疏就加大，等时间插补
+    position_tolerance: 0.005           # 笛卡尔位置成功阈值 (m)
+    orientation_tolerance: 0.05         # 笛卡尔姿态成功阈值 (rad)
+    trajopt_velocity_scale: 1.0         # TrajOpt 下发时把轨迹时间拉长：0.5 ≈ 半速
+    mpc_velocity_scale: 1.0             # MPC 下发时把轨迹时间拉长：0.5 ≈ 半速；跟手时建议 1.0，否则每拍只走前半段
+    execute_trajectory: true            # true：TrajOpt 规划成功后、以及 /follow_mpc 每拍下发 FollowJointTrajectory
+    switch_controllers: true            # true：单臂/双臂之间 switch_controller
+    execute_timeout: 60.0               # 等控制器执行完成的超时 (s)
+    joint_states_topic: /joint_states   # 当前关节
+    base_frame: base_link               # 规划参考系；PoseStamped.frame_id 空或等于此值则不查 TF
+    robot_model_id: ""                  # RViz DisplayTrajectory 的 robot model id；空则用 YAML 名（lycus/k100）
+    planned_trajectory_topic: /curobo/planned_trajectory  # TrajOpt 关节轨迹发布
+    trajectory_marker_topic: ""         # 末端绿线 MarkerArray；空则为 /{robot}_motion_trajectory
+
+    # --- 可视化（调试开）---
+    visualize_trajectory: true          # true：TrajOpt 绿线 + MPC 预测末端/目标球 + /display_planned_path
+    compute_ee_paths: true              # true：TrajOpt 对规划轨迹做 FK 出末端路径（绿线需要它）
+    visualize_mesh_obstacles: true      # true：点云体素发到 /curobo/collision_world（TrajOpt / MPC 共用）
+    visualize_goal_waypoints: true      # true：笛卡尔和关节角的路点/目标都发到 /curobo/goal_waypoints，规划失败也保留
+
+    # --- 点云碰撞 ---
+    use_pointcloud: true                # false：不订点云，按空场景规划
+    pointcloud_topic: /all_points       # 点云；空字符串则不用点云碰撞
+    pointcloud_pitch: 0.02              # 点云转 Mesh 的体素边长 (m)
+    pointcloud_max_points: 40000        # 滤波/下采样后最多保留点数
+    pointcloud_min_range: 0.2           # 距离滤波近端 (m)，仅 filter_pointcloud:=true
+    pointcloud_max_range: 3.0           # 距离滤波远端 (m)，仅 filter_pointcloud:=true
+    filter_pointcloud: false            # true：距离滤波 + 体素下采样
+    require_pointcloud: false           # true：没有点云/TF 则规划失败；false：告警后按空场景
+    pointcloud_parent_frame: base_link  # 点云变到此系再进规划（应与 base_frame 一致）
+    pointcloud_child_frame: camera_color_optical_frame  # 点云所在光学系；空则用消息 header.frame_id
+
+    # --- MPC（/follow_mpc 期间生效）---
+    mpc_device: cuda:0                  # MPC 设备
+    mpc_optimization_dt: 0.14           # knot 步长，务必等于 control_period：一拍正好下发一个 knot
+    mpc_control_period: 0.10            # tick 周期 20 Hz，与状态/目标频率对齐
+    mpc_run_ik: false                   # 纯笛卡尔跟踪；开了会加关节空间吸引点，末端容易停在半路
+    mpc_target_topic: /curobo/target    # 输入 MpcTarget（左右臂位姿合一条）
+    mpc_plan_topic: /curobo/mpc_plan    # 输出 MpcPlan（左右轨迹 + 结果）
+    mpc_missing_target_warn_period: 2.0 # 某一侧目标缺失时的告警间隔 (s)；该臂钉在当前末端

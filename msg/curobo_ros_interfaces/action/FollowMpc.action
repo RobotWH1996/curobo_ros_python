@@ -1,0 +1,18 @@
+# 打开 MPC 跟踪。实时目标走 /curobo/target，周期结果走 /curobo/mpc_plan。
+# 取消 Goal 即关闭。timeout<=0 表示直到取消；tolerance<=0 表示不因到位而自动成功。
+float64 timeout
+float64 position_tolerance
+float64 orientation_tolerance
+---
+bool success
+string message
+---
+bool left_target_valid
+bool right_target_valid
+float64 left_position_error
+float64 left_orientation_error
+float64 right_position_error
+float64 right_orientation_error
+float64 solve_time
+bool plan_success
+string message

@@ -1,0 +1,5 @@
+string group_name
+curobo_ros_interfaces/JointWaypoint[] waypoints
+---
+bool success
+string message

@@ -1,0 +1,9 @@
+string group_name
+geometry_msgs/PoseStamped[] waypoints
+string ee_link
+# 双臂同时笛卡尔规划：与 waypoints 等长。空则另一臂钉在当前位姿。
+geometry_msgs/PoseStamped[] other_waypoints
+string other_ee_link
+---
+bool success
+string message

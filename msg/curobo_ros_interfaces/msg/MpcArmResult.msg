@@ -1,0 +1,7 @@
+# 单臂在本规划周期内的目标使用情况、误差和关节轨迹。
+bool target_valid
+string message
+float32 position_error
+float32 orientation_error
+geometry_msgs/PoseStamped used_target
+trajectory_msgs/JointTrajectory trajectory
