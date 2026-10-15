@@ -82,3 +82,39 @@ def cloud_to_base_points(
     if translation is not None and quat_wxyz is not None:
         pts = transform_points(pts, translation, quat_wxyz)
     return pts, n_raw
+
+
+def exclude_boxes_from_param(value) -> Optional[np.ndarray]:
+    """解析固定剔除盒。每 6 个数一只：xmin, ymin, zmin, xmax, ymax, zmax，单位米，base_link。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.replace(";", " ").replace(",", " ")
+        parts = [p for p in text.split() if p]
+        if not parts:
+            return None
+        nums = [float(p) for p in parts]
+    else:
+        nums = [float(p) for p in value]
+        if not nums:
+            return None
+    if len(nums) < 6:
+        return None
+    if len(nums) % 6 != 0:
+        raise ValueError(f"pointcloud_exclude_boxes 需要 6 的倍数，收到 {len(nums)} 个数")
+    boxes = np.asarray(nums, dtype=np.float32).reshape(-1, 6)
+    lo = np.minimum(boxes[:, :3], boxes[:, 3:])
+    hi = np.maximum(boxes[:, :3], boxes[:, 3:])
+    return np.concatenate((lo, hi), axis=1)
+
+
+def drop_boxes(points: np.ndarray, boxes: Optional[np.ndarray]) -> np.ndarray:
+    """丢掉落在固定盒子里的点。盒子是录包里的夹爪，不随当前手臂动。"""
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    if boxes is None or pts.shape[0] == 0:
+        return pts
+    keep = np.ones(pts.shape[0], dtype=bool)
+    for box in np.asarray(boxes, dtype=np.float32).reshape(-1, 6):
+        inside = np.all((pts >= box[:3]) & (pts <= box[3:]), axis=1)
+        keep &= ~inside
+    return pts[keep]

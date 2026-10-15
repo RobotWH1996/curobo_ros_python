@@ -16,7 +16,7 @@ from curobo_ros_python.planning.convert import (
     stamped_to_pose,
 )
 from curobo_ros_python.planning.groups import GROUP_JOINTS
-from curobo_ros_python.planning.pointcloud import cloud_to_base_points
+from curobo_ros_python.planning.pointcloud import cloud_to_base_points, drop_boxes
 from curobo_ros_python.visualization.publish import publish_collision_world, publish_mpc_preview
 
 
@@ -98,6 +98,9 @@ class MpcFollower:
             use_cuda_graph=bool(node._p("use_cuda_graph")),
             optimization_dt=float(node._p("mpc_optimization_dt")),
             run_ik=bool(node._p("mpc_run_ik")),
+            posture_weight=float(node._p("mpc_posture_weight")),
+            warm_start_iters=int(node._p("mpc_warm_start_iters")),
+            cold_start_iters=int(node._p("mpc_cold_start_iters")),
             lock_joint_values=dict(node._joint_map),
             extra_lock_names=extra_lock_names,
             logger=node.get_logger(),
@@ -159,6 +162,9 @@ class MpcFollower:
             return f"解析点云失败: {exc}"
         if pts.shape[0] == 0:
             return "无点云：点云为空，未更新碰撞场景"
+        pts = drop_boxes(pts, node.static_exclude_boxes())
+        if pts.shape[0] == 0:
+            return "无点云：去掉固定夹爪盒子后为空，未更新碰撞场景"
         mpc.update_world_from_points(pts, pitch=node.pointcloud_pitch)
         publish_collision_world(node, pts)
         return None

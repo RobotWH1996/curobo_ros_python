@@ -40,7 +40,11 @@ from curobo_ros_python.planning.convert import (
     stamped_to_pose,
 )
 from curobo_ros_python.planning.mpc_follow import MpcFollower
-from curobo_ros_python.planning.pointcloud import cloud_to_base_points
+from curobo_ros_python.planning.pointcloud import (
+    cloud_to_base_points,
+    drop_boxes,
+    exclude_boxes_from_param,
+)
 from curobo_ros_python.planning.trajectory import TrajectoryExecutor, joint_map_from_msg
 
 _PARAM_DEFAULTS: Dict[str, Any] = {
@@ -72,6 +76,7 @@ _PARAM_DEFAULTS: Dict[str, Any] = {
     "pointcloud_min_range": 0.2,
     "pointcloud_max_range": 3.0,
     "filter_pointcloud": False,
+    "pointcloud_exclude_boxes": "",
     "require_pointcloud": False,
     "pointcloud_parent_frame": "base_link",
     "pointcloud_child_frame": "camera_depth_optical_frame",
@@ -79,6 +84,9 @@ _PARAM_DEFAULTS: Dict[str, Any] = {
     "mpc_optimization_dt": 0.05,
     "mpc_control_period": 0.05,
     "mpc_run_ik": False,
+    "mpc_posture_weight": 5.0,
+    "mpc_warm_start_iters": 50,
+    "mpc_cold_start_iters": 100,
     "mpc_target_topic": "/curobo/target",
     "mpc_plan_topic": "/curobo/mpc_plan",
     "mpc_missing_target_warn_period": 2.0,
@@ -356,6 +364,22 @@ class CuroboMotionPlanningNode(Node):
         r = tf.transform.rotation
         return [t.x, t.y, t.z], [r.w, r.x, r.y, r.z]
 
+    def static_exclude_boxes(self):
+        """base_link 下的固定剔除盒。仿真 bag 里的夹爪用，真机留空。"""
+        if getattr(self, "_exclude_boxes_ready", False):
+            return self._exclude_boxes
+        self._exclude_boxes_ready = True
+        self._exclude_boxes = None
+        try:
+            self._exclude_boxes = exclude_boxes_from_param(self._p("pointcloud_exclude_boxes"))
+        except (TypeError, ValueError) as exc:
+            self.get_logger().warn(f"pointcloud_exclude_boxes 无法解析: {exc}")
+        if self._exclude_boxes is not None:
+            self.get_logger().info(
+                f"点云去掉 {int(self._exclude_boxes.shape[0])} 个固定盒子（base_link，仿真夹爪）"
+            )
+        return self._exclude_boxes
+
     def _sync_world_from_pointcloud(self) -> Optional[str]:
         if not self.use_pointcloud or not self.pointcloud_topic:
             return None
@@ -396,6 +420,9 @@ class CuroboMotionPlanningNode(Node):
                 else "点云为空，未更新碰撞场景"
             )
             return self._pc_skip_or_fail(empty_msg)
+        pts = drop_boxes(pts, self.static_exclude_boxes())
+        if pts.shape[0] == 0:
+            return self._pc_skip_or_fail("点云去掉固定夹爪盒子后为空，未更新碰撞场景")
         n_used = self.planner.update_world_from_points(
             pts, pitch=self.pointcloud_pitch, name="cam"
         )

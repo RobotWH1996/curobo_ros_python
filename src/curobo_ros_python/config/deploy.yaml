@@ -34,6 +34,7 @@ curobo_motion_planning_node:
     pointcloud_min_range: 0.2           # 距离滤波近端 (m)，仅 filter_pointcloud:=true
     pointcloud_max_range: 3.0           # 距离滤波远端 (m)，仅 filter_pointcloud:=true
     filter_pointcloud: false            # true：距离滤波 + 体素下采样
+    pointcloud_exclude_boxes: ""        # 真机不裁固定盒子。仿真 debug 才填 bag 里的夹爪
     require_pointcloud: false           # true：没有点云/TF 则规划失败；false：告警后按空场景
     pointcloud_parent_frame: base_link  # 点云变到此系再进规划（应与 base_frame 一致）
     pointcloud_child_frame: camera_color_optical_frame  # 点云所在光学系；空则用消息 header.frame_id
@@ -41,8 +42,11 @@ curobo_motion_planning_node:
     # --- MPC（/follow_mpc 期间生效）---
     mpc_device: cuda:0                  # MPC 设备
     mpc_optimization_dt: 0.14           # knot 步长，务必等于 control_period：一拍正好下发一个 knot
-    mpc_control_period: 0.1            # tick 周期 20 Hz，与状态/目标频率对齐
+    mpc_control_period: 0.1            # tick 周期 100 ms。下发轨迹只有 0.105 s，周期更长手臂会空等再抖
+    mpc_warm_start_iters: 50            # 热启动迭代，必须是 inner_iters 25 的倍数。默认 200 次求解约 150 ms
+    mpc_cold_start_iters: 100           # 第一拍迭代，同样是 25 的倍数
     mpc_run_ik: false                   # 纯笛卡尔跟踪；开了会加关节空间吸引点，末端容易停在半路
+    mpc_posture_weight: 5.0             # 只沿末端零空间往关节 0 收，每拍最多 0.04 rad。0 关闭
     mpc_target_topic: /curobo/target    # 输入 MpcTarget（左右臂位姿合一条）
     mpc_plan_topic: /curobo/mpc_plan    # 输出 MpcPlan（左右轨迹 + 结果）
     mpc_missing_target_warn_period: 2.0 # 某一侧目标缺失时的告警间隔 (s)；该臂钉在当前末端
