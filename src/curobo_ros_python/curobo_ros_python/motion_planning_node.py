@@ -45,7 +45,11 @@ from curobo_ros_python.planning.pointcloud import (
     drop_boxes,
     exclude_boxes_from_param,
 )
-from curobo_ros_python.planning.trajectory import TrajectoryExecutor, joint_map_from_msg
+from curobo_ros_python.planning.trajectory import (
+    TrajectoryExecutor,
+    drop_passed_prefix,
+    joint_map_from_msg,
+)
 
 _PARAM_DEFAULTS: Dict[str, Any] = {
     "robot": "lycus.yml",
@@ -81,10 +85,11 @@ _PARAM_DEFAULTS: Dict[str, Any] = {
     "pointcloud_parent_frame": "base_link",
     "pointcloud_child_frame": "camera_depth_optical_frame",
     "mpc_device": "cuda:0",
-    "mpc_optimization_dt": 0.05,
-    "mpc_control_period": 0.05,
+    "mpc_optimization_dt": 0.14,
+    "mpc_control_period": 0.10,
     "mpc_run_ik": False,
     "mpc_posture_weight": 5.0,
+    "mpc_posture": "l",
     "mpc_warm_start_iters": 50,
     "mpc_cold_start_iters": 100,
     "mpc_target_topic": "/curobo/target",
@@ -496,6 +501,30 @@ class CuroboMotionPlanningNode(Node):
             return
         # 不要再把轨迹整体后移一个 knot：delay 等于 tick 时，
         # 第一个点永远在「下一拍」，每拍顶替后命令根本执行不到。
+        # 第一个点已经在读数之后一个 knot。算得比这更慢时，丢掉超前的前缀，
+        # 至少留 0.35 s，下一拍再慢也不会把指令裁没。
+        read_t = getattr(self, "_mpc_state_read_t", None)
+        elapsed = time.monotonic() - read_t if read_t else 0.0
+        algo = getattr(self._mpc, "_mpc", None)
+        lookahead = float(getattr(algo, "optimization_dt", 0.14) or 0.14)
+        skip = max(0.0, elapsed - lookahead)
+        actual = 0.0
+        if skip > 1e-3:
+            if left is not None:
+                left, actual = drop_passed_prefix(left, skip, 0.35)
+            if right is not None:
+                right, right_actual = drop_passed_prefix(right, skip, 0.35)
+                actual = max(actual, right_actual)
+            kept = left if left is not None else right
+            if actual > 1e-3 and kept is not None and algo is not None:
+                algo.note_command_skip(actual)
+                last = kept.points[-1].time_from_start
+                dur = float(last.sec) + float(last.nanosec) * 1e-9
+                self.get_logger().info(
+                    f"本拍 {elapsed*1000:.0f} ms，指令丢掉前 {actual*1000:.0f} ms，"
+                    f"剩下 {len(kept.points)} 点 {dur:.3f} s",
+                    throttle_duration_sec=2.0,
+                )
         self.executor_helper.send_mpc(left, right, start_delay=0.0)
 
     def _execute_follow_mpc(self, goal_handle):

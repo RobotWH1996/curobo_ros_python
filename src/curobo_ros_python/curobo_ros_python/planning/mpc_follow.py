@@ -99,6 +99,7 @@ class MpcFollower:
             optimization_dt=float(node._p("mpc_optimization_dt")),
             run_ik=bool(node._p("mpc_run_ik")),
             posture_weight=float(node._p("mpc_posture_weight")),
+            posture=str(node._p("mpc_posture") or "l"),
             warm_start_iters=int(node._p("mpc_warm_start_iters")),
             cold_start_iters=int(node._p("mpc_cold_start_iters")),
             lock_joint_values=dict(node._joint_map),
@@ -194,6 +195,7 @@ class MpcFollower:
                 throttle_duration_sec=5.0,
             )
         current = mpc.apply_command_continuity(current)
+        node._mpc_state_read_t = time.monotonic()
         lap("state")
         world_err = self._sync_world(mpc)
         lap("world")
@@ -231,6 +233,7 @@ class MpcFollower:
                 node.get_logger().warn(right_note)
 
         lap("target")
+        mpc.set_posture(str(node._p("mpc_posture") or "l"))
         step = mpc.run(current, left_pose, right_pose)
         lap("solve")
         publish_mpc_preview(node, mpc, step)

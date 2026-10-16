@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from action_msgs.msg import GoalStatus
@@ -103,6 +103,38 @@ def combine_joint_trajectories(
 
 def _point_time(pt: JointTrajectoryPoint) -> float:
     return float(pt.time_from_start.sec) + float(pt.time_from_start.nanosec) * 1e-9
+
+
+def drop_passed_prefix(
+    trajectory: JointTrajectory,
+    skip_sec: float,
+    min_keep_sec: float,
+) -> Tuple[JointTrajectory, float]:
+    """丢掉开头已经落后于手臂的那段，剩下的时间从 0 重新计。
+
+    至少留下 min_keep_sec，避免把指令裁得比下一拍还短，手臂再次跑完停住。
+    """
+    if trajectory is None or len(trajectory.points) < 2:
+        return trajectory, 0.0
+    times = [_point_time(pt) for pt in trajectory.points]
+    duration = times[-1]
+    skip = min(max(float(skip_sec), 0.0), max(0.0, duration - float(min_keep_sec)))
+    if skip <= 1e-4:
+        return trajectory, 0.0
+    kept = [pt for pt, t in zip(trajectory.points, times) if t + 1e-9 >= skip]
+    if len(kept) < 2:
+        return trajectory, 0.0
+    origin = _point_time(kept[0])
+    out = JointTrajectory()
+    out.joint_names = list(trajectory.joint_names)
+    out.header.frame_id = trajectory.header.frame_id
+    for src in kept:
+        pt = JointTrajectoryPoint()
+        pt.positions = list(src.positions)
+        pt.velocities = list(src.velocities)
+        pt.time_from_start = _duration(_point_time(src) - origin)
+        out.points.append(pt)
+    return out, origin
 
 
 def shift_trajectory_time(trajectory: JointTrajectory, offset_sec: float) -> JointTrajectory:

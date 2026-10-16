@@ -41,12 +41,13 @@ curobo_motion_planning_node:
 
     # --- MPC（/follow_mpc 期间生效）---
     mpc_device: cuda:0                  # MPC 设备
-    mpc_optimization_dt: 0.14           # knot 步长，务必等于 control_period：一拍正好下发一个 knot
-    mpc_control_period: 0.1            # tick 周期 100 ms。下发轨迹只有 0.105 s，周期更长手臂会空等再抖
+    mpc_optimization_dt: 0.14           # knot 步长。命令点间隔 0.035 s
+    mpc_control_period: 0.10            # tick 目标 100 ms。点云那拍会到 300 ms，指令在代码里盖到 0.5 s
     mpc_warm_start_iters: 50            # 热启动迭代，必须是 inner_iters 25 的倍数。默认 200 次求解约 150 ms
     mpc_cold_start_iters: 100           # 第一拍迭代，同样是 25 的倍数
     mpc_run_ik: false                   # 纯笛卡尔跟踪；开了会加关节空间吸引点，末端容易停在半路
-    mpc_posture_weight: 5.0             # 只沿末端零空间往关节 0 收，每拍最多 0.04 rad。0 关闭
+    mpc_posture_weight: 5.0             # 只沿末端零空间往构型目标收。0 关闭
+    mpc_posture: l                      # 构型目标：l 或 zero。运行中 ros2 param set 即可切换
     mpc_target_topic: /curobo/target    # 输入 MpcTarget（左右臂位姿合一条）
     mpc_plan_topic: /curobo/mpc_plan    # 输出 MpcPlan（左右轨迹 + 结果）
     mpc_missing_target_warn_period: 2.0 # 某一侧目标缺失时的告警间隔 (s)；该臂钉在当前末端

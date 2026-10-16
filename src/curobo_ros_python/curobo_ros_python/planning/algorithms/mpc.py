@@ -25,6 +25,44 @@ from curobo_ros_python.planning.algorithms.common import (
 )
 from curobo_ros_python.planning.groups import both_arm_ee_links
 
+# 左臂 7 关节再右臂 7 关节，与 lycus cspace 顺序一致。躯干不在表里，仍用默认 0。
+# 肘在上，肩离限位留余量，腕关节放在 0，避免 joint_5 顶到 ±3.107。
+_L_POSTURE = {
+    "AR5-5_08L-W4C1C9-ZY2_joint_1": 0.0,
+    "AR5-5_08L-W4C1C9-ZY2_joint_2": 1.20,
+    "AR5-5_08L-W4C1C9-ZY2_joint_3": -1.20,
+    "AR5-5_08L-W4C1C9-ZY2_joint_4": 1.40,
+    "AR5-5_08L-W4C1C9-ZY2_joint_5": 0.0,
+    "AR5-5_08L-W4C1C9-ZY2_joint_6": 0.0,
+    "AR5-5_08L-W4C1C9-ZY2_joint_7": 0.0,
+    "AR5-5_08R-W4C1C9-ZY2_joint_1": 0.0,
+    "AR5-5_08R-W4C1C9-ZY2_joint_2": 1.20,
+    "AR5-5_08R-W4C1C9-ZY2_joint_3": 1.20,
+    "AR5-5_08R-W4C1C9-ZY2_joint_4": 1.40,
+    "AR5-5_08R-W4C1C9-ZY2_joint_5": 0.0,
+    "AR5-5_08R-W4C1C9-ZY2_joint_6": 0.0,
+    "AR5-5_08R-W4C1C9-ZY2_joint_7": 0.0,
+}
+_ZERO_POSTURE = {
+    "AR5-5_08L-W4C1C9-ZY2_joint_1": 0.0,
+    "AR5-5_08L-W4C1C9-ZY2_joint_2": 0.0,
+    "AR5-5_08L-W4C1C9-ZY2_joint_3": 0.0,
+    "AR5-5_08L-W4C1C9-ZY2_joint_4": 0.0,
+    "AR5-5_08L-W4C1C9-ZY2_joint_5": 0.0,
+    "AR5-5_08L-W4C1C9-ZY2_joint_6": 0.0,
+    "AR5-5_08L-W4C1C9-ZY2_joint_7": 0.0,
+    "AR5-5_08R-W4C1C9-ZY2_joint_1": 0.0,
+    "AR5-5_08R-W4C1C9-ZY2_joint_2": 0.0,
+    "AR5-5_08R-W4C1C9-ZY2_joint_3": 0.0,
+    "AR5-5_08R-W4C1C9-ZY2_joint_4": 0.0,
+    "AR5-5_08R-W4C1C9-ZY2_joint_5": 0.0,
+    "AR5-5_08R-W4C1C9-ZY2_joint_6": 0.0,
+    "AR5-5_08R-W4C1C9-ZY2_joint_7": 0.0,
+}
+_POSTURE_TABLES = {
+    "l": _L_POSTURE,
+    "zero": _ZERO_POSTURE,
+}
 
 def _rotvec_wxyz(q_from: torch.Tensor, q_to: torch.Tensor) -> torch.Tensor:
     """q_from 转到 q_to 的旋转向量，四元数 wxyz。"""
@@ -76,6 +114,7 @@ class DualArmMpc:
         optimization_dt: float = 0.05,
         run_ik: bool = False,
         posture_weight: float = 5.0,
+        posture: str = "l",
         warm_start_iters: int = 50,
         cold_start_iters: int = 100,
         lock_joint_values: Optional[Dict[str, float]] = None,
@@ -85,12 +124,14 @@ class DualArmMpc:
         self._log = logger
         self.run_ik = bool(run_ik)
         self.posture_weight = float(posture_weight)
+        self.posture_name = "l"
+        self._posture_ready = False
         self.warm_start_iters = _multiple_of(warm_start_iters, 25)
         self.cold_start_iters = max(
             self.warm_start_iters, _multiple_of(cold_start_iters, 25)
         )
-        self._posture_logged = False
         self._warn_at: Dict[str, float] = {}
+        self.set_posture(posture)
         self.device_cfg = DeviceCfg(device=torch.device(device), dtype=torch.float32)
         self.optimization_dt = float(optimization_dt)
         self.interpolation_steps = 4
@@ -107,6 +148,9 @@ class DualArmMpc:
             interpolation_steps=self.interpolation_steps,
             warm_start_optimization_num_iters=self.warm_start_iters,
             cold_start_optimization_num_iters=self.cold_start_iters,
+            # 下发的是前几个 knot。默认 0.001 时它们几乎感觉不到末端代价，
+            # 加速度惩罚 10000 会把 15 cm 台阶压成几乎不动。
+            non_terminal_tool_pose_weight_factor=0.05,
         )
         # scene_model 为空时 cuRobo 会丢掉 collision_cache，检查器不会被创建。
         # 点云要靠 load_collision_model 装进去，所以这里按 TrajOpt 的方式补一个空场景。
@@ -116,6 +160,15 @@ class DualArmMpc:
                 cache={"mesh": 1},
             )
         self.mpc = ModelPredictiveControl(cfg)
+        # 默认只下发 4 个点、0.105 s。点云那拍会到 0.3 s，指令先跑完，控制器停住再起步就是抖。
+        # 多下发已经规划好的插值点，盖住 0.50 s。knot 步长和加速度惩罚不动。
+        mgr = self.mpc.trajectory_execution_manager
+        cover_s = 0.50
+        n_cmd = int(cover_s / self.command_dt) + 1
+        if (n_cmd - 1) * self.command_dt < cover_s:
+            n_cmd += 1
+        mgr.command_end_idx = mgr.command_start_idx + n_cmd
+        self._command_points = n_cmd
         self.left_ee, self.right_ee = both_arm_ee_links()
         missing = [n for n in (self.left_ee, self.right_ee) if n not in self.mpc.tool_frames]
         if missing:
@@ -124,13 +177,19 @@ class DualArmMpc:
             )
         self._setup_done = False
         self._last_goal_key = None
-        self._last_cmd_vel = None
-        self._last_cmd_acc = None
+        self._cmd_vel_seq = None
+        self._cmd_acc_seq = None
+        self._cmd_stamp = None
+        self._cmd_skip = 0.0
         self._info(
             f"MPC 已创建，tool_frames={self.mpc.tool_frames}，"
             f"dt={self.optimization_dt} command_dt={self.command_dt:.4f} "
-            f"run_ik={self.run_ik} posture_weight={self.posture_weight:g}，"
-            f"warm_iters={self.warm_start_iters} cold_iters={self.cold_start_iters}，"
+            f"command={self._command_points} 点 "
+            f"{(self._command_points - 1) * self.command_dt:.3f} s "
+            f"run_ik={self.run_ik} posture={self.posture_name} "
+            f"posture_weight={self.posture_weight:g}，"
+            f"warm_iters={self.warm_start_iters} cold_iters={self.cold_start_iters} "
+            f"nonterminal_pose={cfg.non_terminal_tool_pose_weight_factor:g}，"
             f"规划关节 {len(self.joint_names)} 个"
         )
         if self.locked_joints:
@@ -172,27 +231,48 @@ class DualArmMpc:
         return self.optimization_dt / float(self.interpolation_steps)
 
     def apply_command_continuity(self, state: JointState) -> JointState:
-        """速度/加速度沿用上一拍命令，避免求解器每拍以为机器人急停。"""
-        if self._last_cmd_vel is None:
+        """速度/加速度沿用上一拍命令里、和实际经过时间对齐的那一个点。"""
+        if self._cmd_vel_seq is None or self._cmd_stamp is None:
             return state
-        state.velocity = self._last_cmd_vel.clone()
-        state.acceleration = self._last_cmd_acc.clone()
+        elapsed = time.monotonic() - self._cmd_stamp + self._cmd_skip
+        idx = int(round(elapsed / self.command_dt))
+        last = self._cmd_vel_seq.shape[0] - 1
+        if idx < 0:
+            idx = 0
+        elif idx > last:
+            idx = last
+        state.velocity = self._cmd_vel_seq[idx : idx + 1].clone()
+        state.acceleration = self._cmd_acc_seq[idx : idx + 1].clone()
         return state
 
     def remember_command(self, result) -> None:
-        """记住本拍最后一个命令点的速度/加速度，供下一拍接力。"""
+        """记下整段命令的速度/加速度。下一拍按经过的时间取点，不拿最末点。"""
         seq = getattr(result, "action_sequence", None)
         if seq is None or seq.position is None:
             return
         vel, acc = seq.velocity, seq.acceleration
         if vel is None or acc is None:
             return
-        self._last_cmd_vel = vel.detach().reshape(-1, vel.shape[-1])[-1:].clone()
-        self._last_cmd_acc = acc.detach().reshape(-1, acc.shape[-1])[-1:].clone()
+        if not torch.isfinite(seq.position).all():
+            self.forget_command()
+            return
+        if not torch.isfinite(vel).all() or not torch.isfinite(acc).all():
+            self.forget_command()
+            return
+        self._cmd_vel_seq = vel.detach().reshape(-1, vel.shape[-1]).clone()
+        self._cmd_acc_seq = acc.detach().reshape(-1, acc.shape[-1]).clone()
+        self._cmd_stamp = time.monotonic()
+        self._cmd_skip = 0.0
+
+    def note_command_skip(self, skip_sec: float) -> None:
+        """下发时丢掉的前缀。下一拍取速度要加上这段，才和手臂正在走的点对齐。"""
+        self._cmd_skip = max(float(skip_sec), 0.0)
 
     def forget_command(self) -> None:
-        self._last_cmd_vel = None
-        self._last_cmd_acc = None
+        self._cmd_vel_seq = None
+        self._cmd_acc_seq = None
+        self._cmd_stamp = None
+        self._cmd_skip = 0.0
 
     def update_world_from_points(self, points: np.ndarray, pitch: float, name: str = "cam") -> int:
         pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
@@ -270,9 +350,9 @@ class DualArmMpc:
         left_pose: Optional[Pose],
         right_pose: Optional[Pose],
     ) -> None:
-        """沿末端雅可比的零空间，把关节往 default_joint_position（全 0）收。
+        """沿末端雅可比的零空间，把关节往 L 构型收。
 
-        直接把全部关节的目标设成 0 时，手的位姿对不上，短时域会扎进点云，
+        直接把全部关节的目标设成 L 构型时，手的位姿对不上，短时域会扎进点云，
         整段轨迹被判成不可行，send 变成 0。零空间方向不改变末端，只收多余自由度。
         """
         weight = self.posture_weight
@@ -283,7 +363,10 @@ class DualArmMpc:
             self._warn_throttled("no_goal_js", "MPC 还没有 goal_js，跳过构型代价")
             return
         q = current_state.position.detach().reshape(-1)
-        default = self.default_joint_position.reshape(-1).to(device=q.device, dtype=q.dtype)
+        if not torch.isfinite(q).all():
+            self._warn_throttled("posture_nan", "关节位置不是有限数，本拍不附加构型代价")
+            return
+        default = self._l_posture(q)
         goal_js = goal_buffer.goal_js.clone()
         if goal_js.position.shape[-1] != q.numel() or default.numel() != q.numel():
             self._warn_throttled(
@@ -306,22 +389,64 @@ class DualArmMpc:
         lower, upper = self._joint_position_limits(q.device, q.dtype)
         if lower is not None:
             q_ref = torch.max(torch.min(q_ref, upper), lower)
+        dq = (q_ref - q).detach().reshape(-1)
+        if not torch.isfinite(dq).all() or float(torch.linalg.norm(dq)) > self._POSTURE_STEP + 1e-3:
+            self._warn_throttled("posture_step", "构型步长异常，本拍不附加构型代价")
+            return
         goal_js.position = goal_js.position.clone()
         goal_js.position[...] = q_ref
         self.mpc.update_goal_state(goal_js)
         self._write_posture_weight(weight)
         if not self._write_dof_weight(dof_w):
             return
+        # 配置里非末端只有 0.05，下发的是时域开头几个点，构型代价等于没加在正在执行的轨迹上。
+        self._write_nonterminal_factor(1.0)
         self.mpc.enable_joint_position_tracking()
-        if self._posture_logged:
-            return
-        self._posture_logged = True
-        self._info(
-            f"构型沿零空间收向关节 0，权重 {weight:g}，每拍最多 "
-            f"{self._POSTURE_STEP:.2f} rad"
-        )
+        self._info(self._posture_line(dq, weight))
 
-    _POSTURE_STEP = 0.04
+    _POSTURE_STEP = 1.0
+
+    def set_posture(self, name: str) -> None:
+        """在 l 和 zero 之间切换零空间收拢目标。同名重复调用不做事。"""
+        key = str(name or "l").strip().lower()
+        if key not in _POSTURE_TABLES:
+            self._warn_throttled(
+                "posture_name",
+                f"未知构型 {name!r}，可选 {sorted(_POSTURE_TABLES)}，仍用 {self.posture_name}",
+            )
+            return
+        if key == self.posture_name and getattr(self, "_posture_ready", False):
+            return
+        self.posture_name = key
+        self._posture_ready = True
+        self._info(f"构型目标切换为 {key}")
+
+    def _l_posture(self, q: torch.Tensor) -> torch.Tensor:
+        """按关节名写入当前构型。不在表里的关节保持默认位置。"""
+        table = _POSTURE_TABLES[self.posture_name]
+        target = self.default_joint_position.reshape(-1).to(device=q.device, dtype=q.dtype).clone()
+        if target.numel() != q.numel():
+            target = torch.zeros_like(q)
+        names = self.joint_names
+        for i, name in enumerate(names):
+            if i >= target.numel():
+                break
+            if name in table:
+                target[i] = table[name]
+        return target
+
+    def _posture_line(self, dq: torch.Tensor, weight: float) -> str:
+        names = self.joint_names
+        parts = []
+        for i, value in enumerate(dq.tolist()):
+            name = names[i] if i < len(names) else f"j{i}"
+            parts.append(f"{name}={value:+.4f}")
+        norm = float(torch.linalg.norm(dq))
+        return (
+            f"构型本拍零空间收了 ||Δq||={norm:.4f} rad"
+            f"（{self.posture_name}，权重 {weight:g}，上限 {self._POSTURE_STEP:.2f}） "
+            + " ".join(parts)
+        )
 
     def _nullspace_toward(
         self,
@@ -417,6 +542,20 @@ class DualArmMpc:
             self._warn_throttled("dof_weight", "构型自由度权重写不进去，本拍不附加构型代价")
         return wrote
 
+    def _write_nonterminal_factor(self, factor: float) -> None:
+        value = torch.tensor(
+            [float(factor)], device=self.device_cfg.device, dtype=self.device_cfg.dtype
+        )
+        for rollout in self.mpc.core.get_all_rollout_instances(include_optimizer_rollouts=True):
+            for cost in rollout.get_cost_component_by_name("cspace"):
+                if cost is None:
+                    continue
+                current = cost.config.cspace_non_terminal_weight_factor
+                if current is None or current.shape != value.shape or current.device != value.device:
+                    cost.config.cspace_non_terminal_weight_factor = value.clone()
+                else:
+                    current.copy_(value)
+
     def _write_posture_weight(self, weight: float) -> None:
         value = torch.tensor(
             [float(weight)], device=self.device_cfg.device, dtype=self.device_cfg.dtype
@@ -457,7 +596,13 @@ class DualArmMpc:
             # 日志里就是第一拍 send>0、后面每拍 send=0。本拍真正执行的是前面几个命令点，
             # 有动作序列就下发。不要在不可行时从当前关节重解，那会丢掉热启动，手臂来回抖。
             success = getattr(result, "action_sequence", None) is not None
-            if not success:
+            seq = getattr(result, "action_sequence", None)
+            if success and seq is not None and seq.position is not None:
+                if not torch.isfinite(seq.position).all():
+                    success = False
+                    message = "MPC 动作序列不是有限数，本拍不下发"
+                    self.forget_command()
+            if not success and not message:
                 message = "MPC 无动作序列"
         else:
             message = "MPC 无结果"
