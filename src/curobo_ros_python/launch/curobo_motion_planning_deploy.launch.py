@@ -54,7 +54,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "curobo_python",
                 default_value="",
-                description="带 torch 的 Python 3.10；空则用 cuRobo .venv / CUROBO_PYTHON",
+                description="带 torch 的 Python 3.10；空则用已激活环境或旁边的 cuRobo .venv",
             ),
             OpaqueFunction(function=_launch_setup),
         ]

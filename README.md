@@ -47,11 +47,11 @@ curobo_ros_python/
 ## 依赖
 
 - ROS 2 Humble（`/opt/ros/humble`，apt）
-- cuRobo 的 uv 环境：`/home/victor/wh/curobo/curobo/.venv`（Python 3.10，能 `import curobo` 和 `torch`）
+- cuRobo 仓库根目录的 `.venv`（与本仓库同级的 `../curobo/.venv`，Python 3.10，能 `import curobo` 和 `torch`）
 - NVIDIA GPU + CUDA
 - 机器人 bringup：`/joint_states`、臂控制器、TF
 
-zsh 下 source `setup.zsh`。节点 Python 查找顺序：launch 参数 `curobo_python` → 环境变量 `CUROBO_PYTHON`。本机没有 conda，启动前要指到这个 `.venv`。
+zsh 下 source `setup.zsh`。节点 Python 查找顺序：launch 参数 `curobo_python` → 环境变量 `CUROBO_PYTHON` → 当前虚拟环境或 conda → 从本仓库和当前目录向上找到的 cuRobo `.venv`。不写死本机路径。
 
 ## 编译
 
@@ -64,11 +64,10 @@ colcon build --symlink-install
 source install/setup.zsh
 ```
 
-`colcon` 用 ROS 的 Python。跑规划节点时再使用 cuRobo 的 uv 环境：
+`colcon` 用 ROS 的 Python。规划节点会自己找到旁边 cuRobo 仓库的 `.venv`。也可以先激活它：
 
 ```bash
-source /home/victor/wh/curobo/curobo/.venv/bin/activate
-export CUROBO_PYTHON=/home/victor/wh/curobo/curobo/.venv/bin/python
+source ../curobo/.venv/bin/activate
 ```
 
 链到已有工作空间：
@@ -108,9 +107,9 @@ ros2 launch curobo_ros_python curobo_motion_planning.launch.py execute_trajector
 # 跳过 TrajOpt warmup（启动快，第一次规划慢）
 ros2 launch curobo_ros_python curobo_motion_planning.launch.py warmup_iterations:=0
 
-# 指定 Python（uv 环境）
+# 自动找到的解释器不对时，再显式指定
 ros2 launch curobo_ros_python curobo_motion_planning.launch.py \
-  curobo_python:=/home/victor/wh/curobo/curobo/.venv/bin/python
+  curobo_python:=/path/to/curobo/.venv/bin/python
 ```
 
 `config:=deploy.yaml` 会按部署配置跑调试 launch。细节参数改 yaml；注释写在 yaml 里。
@@ -317,7 +316,7 @@ debug / deploy 的点云话题是 `/all_points`。节点在没读到 yaml 时的
 - **服务很久才返回**：正常。TrajOpt warmup 和第一次规划更慢；MPC 第一次 `follow_mpc` 的第一拍会冷启动。
 - **`尚未收到 /joint_states`**：先起机器人状态发布。
 - **Action 不可用 / 轨迹没执行**：控制器没起来，或 `execute_trajectory:=false`。deploy 默认就是 false，只发 `/curobo/mpc_plan` 和 `/curobo/planned_trajectory`。
-- **`import curobo` / `No module named torch`**：launch 没用 cuRobo 的 uv Python。设 `curobo_python:=/home/victor/wh/curobo/curobo/.venv/bin/python` 或 `CUROBO_PYTHON`。
+- **`import curobo` / `No module named torch`**：launch 没找到 cuRobo 的 `.venv`。激活该环境，或设置 `curobo_python` / `CUROBO_PYTHON`。
 - **zsh 里 source setup.bash 找不到 setup.sh**：改用 `setup.zsh`。
 - **IK / 规划失败**：看 `message`。会区分末端不可达、自碰、场景碰撞、关节限位。Lycus 末端不要用单位四元数当目标。
 - **点云没进规划**：要有 TF `camera_color_optical_frame → base_link`，以及 `/all_points` 有数据。

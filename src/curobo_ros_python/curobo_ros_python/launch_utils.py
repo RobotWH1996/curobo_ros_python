@@ -7,42 +7,21 @@ import subprocess
 
 
 def resolve_python(explicit: str) -> str:
-    """ros2 本身是系统 Python；节点必须用带 torch 的 3.10。"""
-    candidates = []
-    explicit = (explicit or "").strip()
-    if explicit:
-        candidates.append(os.path.expanduser(explicit))
-    env_py = os.environ.get("CUROBO_PYTHON", "").strip()
-    if env_py:
-        candidates.append(os.path.expanduser(env_py))
-    candidates.append(
-        os.path.expanduser("~/wh/curobo/curobo/.venv/bin/python")
-    )
-    candidates.append(os.path.expanduser("~/miniconda3/envs/curobo310_test/bin/python"))
-    conda = os.environ.get("CONDA_PREFIX", "")
-    if conda:
-        candidates.append(os.path.join(conda, "bin", "python"))
+    """ros2 本身是系统 Python；节点必须用带 torch 的 3.10。
 
-    seen = []
-    for path in candidates:
+    查找顺序：launch 参数、``CUROBO_PYTHON``、已激活的虚拟环境或 conda、
+    再从本文件和当前目录向上找 cuRobo 仓库里的 ``.venv``。
+    """
+    seen: list[str] = []
+    for path in _python_candidates(explicit):
         if not path or path in seen:
             continue
         seen.append(path)
-        if not (os.path.isfile(path) and os.access(path, os.X_OK)):
-            continue
-        try:
-            ver = subprocess.check_output(
-                [path, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-        except (OSError, subprocess.CalledProcessError):
-            continue
-        if ver == "3.10":
+        if _usable_curobo_python(path):
             return path
     raise RuntimeError(
-        "找不到 Python 3.10（需要能 import torch/curobo）。"
-        "请使用 cuRobo 的 uv 环境 ~/wh/curobo/curobo/.venv，"
+        "找不到能 import torch/curobo 的 Python 3.10。"
+        "请激活 cuRobo 仓库的 .venv，"
         "或设置 launch 参数 curobo_python / 环境变量 CUROBO_PYTHON。"
         f" 已尝试: {seen}"
     )
@@ -55,3 +34,67 @@ def conda_lib_env(python_exe: str) -> dict:
     if os.path.isdir(lib_dir):
         extra_env["LD_LIBRARY_PATH"] = lib_dir + os.pathsep + os.environ.get("LD_LIBRARY_PATH", "")
     return extra_env
+
+
+def _python_candidates(explicit: str) -> list[str]:
+    candidates: list[str] = []
+    explicit = (explicit or "").strip()
+    if explicit:
+        candidates.append(os.path.expanduser(explicit))
+    env_py = os.environ.get("CUROBO_PYTHON", "").strip()
+    if env_py:
+        candidates.append(os.path.expanduser(env_py))
+    virtual_env = os.environ.get("VIRTUAL_ENV", "").strip()
+    if virtual_env:
+        candidates.append(os.path.join(os.path.expanduser(virtual_env), "bin", "python"))
+    candidates.extend(_nearby_curobo_pythons())
+    conda = os.environ.get("CONDA_PREFIX", "").strip()
+    if conda:
+        candidates.append(os.path.join(os.path.expanduser(conda), "bin", "python"))
+    return candidates
+
+
+def _nearby_curobo_pythons() -> list[str]:
+    """向上找 cuRobo 仓库的 ``.venv/bin/python``，不写死本机目录。"""
+    found: list[str] = []
+    roots = (os.path.dirname(os.path.realpath(__file__)), os.getcwd())
+    seen_dirs: set[str] = set()
+    for root in roots:
+        current = os.path.abspath(root)
+        while current not in seen_dirs:
+            seen_dirs.add(current)
+            repo = current if _is_curobo_repo(current) else os.path.join(current, "curobo")
+            if _is_curobo_repo(repo):
+                found.append(os.path.join(repo, ".venv", "bin", "python"))
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+    return found
+
+
+def _is_curobo_repo(path: str) -> bool:
+    return os.path.isfile(os.path.join(path, "pyproject.toml")) and os.path.isfile(
+        os.path.join(path, "curobo", "__init__.py")
+    )
+
+
+def _usable_curobo_python(path: str) -> bool:
+    if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+        return False
+    script = (
+        "import sys\n"
+        "if sys.version_info[:2] != (3, 10):\n"
+        "    raise SystemExit(1)\n"
+        "import torch, curobo\n"
+    )
+    try:
+        subprocess.check_call(
+            [path, "-c", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
