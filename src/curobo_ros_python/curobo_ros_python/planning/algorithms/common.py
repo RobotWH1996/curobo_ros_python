@@ -74,3 +74,45 @@ def robot_cfg_with_locked_joints(
             locks[name] = 0.0
     kinematics["lock_joints"] = locks
     return data, locks
+
+
+def pop_cached_mesh(checker, name: str):
+    """按名字取出已上传的网格。
+
+    cuRobo 的 Warp 缓存只认名字。点云每拍都叫同一个名字时，
+    不先取出，新几何会被丢掉，碰撞一直用第一帧。
+    调用方在加载成功后再丢掉返回值，旧 BVH 才会释放。
+    加载失败时要把返回值交回 ``restore_cached_mesh``：底层会先清空场景槽，
+    只把对象留在本地变量里并不会把碰撞环境装回去。
+    """
+    meshes = getattr(getattr(checker, "data", None), "meshes", None)
+    cache = getattr(meshes, "wp_cache", None)
+    if not cache:
+        return None
+    return cache.pop(name, None)
+
+
+def restore_cached_mesh(checker, name: str, old) -> None:
+    """加载失败后把取出的网格装回缓存和场景槽。
+
+    ``load_collision_model`` 先把环境槽的 enable/count/names 清掉，再上传新网格。
+    失败时新网格可能已经进了缓存，场景槽却已经空了。这里先放回旧网格，
+    再用它的 Warp id 把槽位写回去，最后才释放上传失败的那份。
+    """
+    meshes = getattr(getattr(checker, "data", None), "meshes", None)
+    cache = getattr(meshes, "wp_cache", None)
+    if cache is None:
+        return
+    failed = cache.pop(name, None)
+    if old is None:
+        if failed is not None:
+            del failed
+        return
+    cache[name] = old
+    pose = Pose.from_list([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], meshes.device_cfg)
+    meshes.update_from_warp_id(int(old.mesh_id), name, w_obj_pose=pose)
+    idx = meshes.names[0].index(name)
+    lower, upper = old.get_bounds()
+    meshes.dims[0, idx, :3] = upper - lower
+    if failed is not None and failed is not old:
+        del failed

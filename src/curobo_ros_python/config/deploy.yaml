@@ -7,9 +7,13 @@ curobo_motion_planning_node:
     warmup_iterations: 3                # TrajOpt CUDA graph warmup 次数；0 则启动快、第一次规划慢
     use_cuda_graph: true                # 是否捕获 CUDA graph；关则调试方便、稳态更慢
     interpolation_dt: 0.02              # 规划轨迹插值步长 (s)
-    position_tolerance: 0.005           # 笛卡尔位置成功阈值 (m)
-    orientation_tolerance: 0.05         # 笛卡尔姿态成功阈值 (rad)
-    trajopt_velocity_scale: 1.0         # TrajOpt 下发时把轨迹时间拉长：0.5 ≈ 半速
+    trajopt_num_seeds: 2                # 并行种子。关节目标各种子相同，1 最快；位姿目标失败多了再调回 4
+    trajopt_finetune_attempts: 1        # 首解后再压时间的轮数。0 只求可行（最快），3 是 cuRobo 原默认（4 轮 L-BFGS）
+    trajopt_num_iters: 50               # 每轮 L-BFGS 步数，必须是 25 的倍数。障碍里失败再调回 100
+    position_tolerance: 0.005           # 笛卡尔位置成功阈值 (m)，也用于中间笛卡尔路点验收
+    orientation_tolerance: 0.05         # 笛卡尔姿态成功阈值 (rad)，也用于中间笛卡尔路点验收
+    waypoint_joint_tolerance: 0.1       # 中间关节路点允许的单关节误差 (rad)
+    trajopt_velocity_scale: 0.5         # TrajOpt 下发时把轨迹时间拉长：0.5 ≈ 半速
     mpc_velocity_scale: 1.0             # MPC 下发时把轨迹时间拉长：0.5 ≈ 半速；跟手时建议 1.0，否则每拍只走前半段
     execute_trajectory: false           # 部署：只发轨迹 topic，不 FollowJointTrajectory
     switch_controllers: false           # 部署：不切 left/right/both 控制器
@@ -29,19 +33,28 @@ curobo_motion_planning_node:
     # --- 点云碰撞 ---
     use_pointcloud: true                # false：不订点云，按空场景规划
     pointcloud_topic: /all_points       # 点云；空字符串则不用点云碰撞
-    pointcloud_pitch: 0.02              # 点云转 Mesh 的体素边长 (m)
+    pointcloud_collision: mesh         # TrajOpt 点云碰撞：mesh 三角网格，voxel 距离场。MPC 仍用网格
+    pointcloud_voxel_dims: [2.0, 2.0, 2.0]      # voxel 时盒子边长 (m)，base_link。mesh 时忽略
+    pointcloud_voxel_center: [0.2, 0.0, 1.0]    # voxel 时盒子中心 (m)。盒子外的点当作没有障碍
+    pointcloud_pitch: 0.02              # mesh 的体素边长，也是 voxel 格子边长 (m)
     pointcloud_max_points: 40000        # 滤波/下采样后最多保留点数
     pointcloud_min_range: 0.2           # 距离滤波近端 (m)，仅 filter_pointcloud:=true
     pointcloud_max_range: 3.0           # 距离滤波远端 (m)，仅 filter_pointcloud:=true
     filter_pointcloud: false            # true：距离滤波 + 体素下采样
+    # 变到 base_link 后只留手臂够得到的盒子。躯干锁 0：肩高 1.24 m、臂长 0.87 m，外加 0.18 m。
+    pointcloud_bounds_min: [0.00, -1.15, 0.20]   # xmin, ymin, zmin (m)
+    pointcloud_bounds_max: [1.05, 1.15, 1.90]    # xmax, ymax, zmax (m)
     pointcloud_exclude_boxes: ""        # 真机不裁固定盒子。仿真 debug 才填 bag 里的夹爪
     require_pointcloud: false           # true：没有点云/TF 则规划失败；false：告警后按空场景
     pointcloud_parent_frame: base_link  # 点云变到此系再进规划（应与 base_frame 一致）
     pointcloud_child_frame: camera_color_optical_frame  # 点云所在光学系；空则用消息 header.frame_id
 
     # --- MPC（/follow_mpc 期间生效）---
+    mpc_prewarm: true                   # 启动时把列出的模式各预热一次，之后不再重建
+    mpc_prewarm_modes: [left_arm, right_arm, both_arms] # 缓存三种模式；增加显存和启动准备时间
     mpc_device: cuda:0                  # MPC 设备
     mpc_optimization_dt: 0.14           # knot 步长。命令点间隔 0.035 s
+    mpc_num_control_points: 6           # B 样条控制点数。可填大于 5 的整数，常用 6 / 8 / 16（16 为 cuRobo 默认）。越小求解越快、向前看得越短：6 约 1.4 s，8 约 1.7 s，16 约 2.8 s。改完需重启重新预热
     mpc_control_period: 0.10            # tick 目标 100 ms。点云那拍会到 300 ms，指令在代码里盖到 0.5 s
     mpc_warm_start_iters: 50            # 热启动迭代，必须是 inner_iters 25 的倍数。默认 200 次求解约 150 ms
     mpc_cold_start_iters: 100           # 第一拍迭代，同样是 25 的倍数

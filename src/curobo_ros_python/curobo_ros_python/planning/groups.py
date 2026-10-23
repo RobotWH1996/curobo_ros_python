@@ -32,22 +32,22 @@ K100_RIGHT = [
 ]
 
 LYCUS_LEFT = [
-    "AR5-5_08L-W4C1C9-ZY2_joint_1",
-    "AR5-5_08L-W4C1C9-ZY2_joint_2",
-    "AR5-5_08L-W4C1C9-ZY2_joint_3",
-    "AR5-5_08L-W4C1C9-ZY2_joint_4",
-    "AR5-5_08L-W4C1C9-ZY2_joint_5",
-    "AR5-5_08L-W4C1C9-ZY2_joint_6",
-    "AR5-5_08L-W4C1C9-ZY2_joint_7",
+    "AR5-5_08L-W4C1C5-ZY2_joint_1",
+    "AR5-5_08L-W4C1C5-ZY2_joint_2",
+    "AR5-5_08L-W4C1C5-ZY2_joint_3",
+    "AR5-5_08L-W4C1C5-ZY2_joint_4",
+    "AR5-5_08L-W4C1C5-ZY2_joint_5",
+    "AR5-5_08L-W4C1C5-ZY2_joint_6",
+    "AR5-5_08L-W4C1C5-ZY2_joint_7",
 ]
 LYCUS_RIGHT = [
-    "AR5-5_08R-W4C1C9-ZY2_joint_1",
-    "AR5-5_08R-W4C1C9-ZY2_joint_2",
-    "AR5-5_08R-W4C1C9-ZY2_joint_3",
-    "AR5-5_08R-W4C1C9-ZY2_joint_4",
-    "AR5-5_08R-W4C1C9-ZY2_joint_5",
-    "AR5-5_08R-W4C1C9-ZY2_joint_6",
-    "AR5-5_08R-W4C1C9-ZY2_joint_7",
+    "AR5-5_08R-W4C1C5-ZY2_joint_1",
+    "AR5-5_08R-W4C1C5-ZY2_joint_2",
+    "AR5-5_08R-W4C1C5-ZY2_joint_3",
+    "AR5-5_08R-W4C1C5-ZY2_joint_4",
+    "AR5-5_08R-W4C1C5-ZY2_joint_5",
+    "AR5-5_08R-W4C1C5-ZY2_joint_6",
+    "AR5-5_08R-W4C1C5-ZY2_joint_7",
 ]
 
 _CONTROLLER_SWITCH = {

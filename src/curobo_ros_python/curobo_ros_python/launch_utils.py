@@ -28,11 +28,22 @@ def resolve_python(explicit: str) -> str:
 
 
 def conda_lib_env(python_exe: str) -> dict:
-    conda_prefix = os.path.dirname(os.path.dirname(os.path.abspath(python_exe)))
+    """把虚拟环境的 lib 放在系统 CUDA 前面，并补上 PyTorch 缺的两个符号。
+
+    Jetson 的 cuSOLVER 11.6 能正常建句柄，但没有
+    ``cusolverDnXsyevBatched``。PyPI 的 11.7 有这两个符号，
+    在 CUDA 12.6 驱动上 ``cusolverDnCreate`` 会失败。
+    ``libcusolver_batched_stub.so`` 只提供这两个符号，其余仍用系统库。
+    """
+    prefix = os.path.dirname(os.path.dirname(os.path.abspath(python_exe)))
     extra_env = {}
-    lib_dir = os.path.join(conda_prefix, "lib")
+    lib_dir = os.path.join(prefix, "lib")
     if os.path.isdir(lib_dir):
         extra_env["LD_LIBRARY_PATH"] = lib_dir + os.pathsep + os.environ.get("LD_LIBRARY_PATH", "")
+    stub = os.path.join(lib_dir, "libcusolver_batched_stub.so")
+    if os.path.isfile(stub):
+        preload = os.environ.get("LD_PRELOAD", "").strip()
+        extra_env["LD_PRELOAD"] = stub if not preload else stub + " " + preload
     return extra_env
 
 

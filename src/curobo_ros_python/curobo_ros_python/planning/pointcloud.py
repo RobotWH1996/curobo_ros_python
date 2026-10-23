@@ -66,6 +66,21 @@ def _filter_and_downsample(
     return pts
 
 
+def crop_bounds(
+    points: np.ndarray,
+    bounds_min: Optional[Sequence[float]],
+    bounds_max: Optional[Sequence[float]],
+) -> np.ndarray:
+    """只保留 base_link 轴对齐盒子里的点。盒子外的点不参与后面的栅格化。"""
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+    if pts.shape[0] == 0 or bounds_min is None or bounds_max is None:
+        return pts
+    lo = np.asarray(bounds_min, dtype=np.float32).reshape(3)
+    hi = np.asarray(bounds_max, dtype=np.float32).reshape(3)
+    keep = np.all((pts >= lo) & (pts <= hi), axis=1)
+    return pts[keep]
+
+
 def cloud_to_base_points(
     msg: PointCloud2,
     translation: Optional[Sequence[float]],
@@ -75,13 +90,15 @@ def cloud_to_base_points(
     pitch: float,
     max_points: int,
     filter_cloud: bool = False,
+    bounds_min: Optional[Sequence[float]] = None,
+    bounds_max: Optional[Sequence[float]] = None,
 ) -> Tuple[np.ndarray, int]:
     raw = _xyz_from_cloud(msg)
     n_raw = int(raw.shape[0])
     pts = _filter_and_downsample(raw, min_range, max_range, pitch, max_points) if filter_cloud else raw
     if translation is not None and quat_wxyz is not None:
         pts = transform_points(pts, translation, quat_wxyz)
-    return pts, n_raw
+    return crop_bounds(pts, bounds_min, bounds_max), n_raw
 
 
 def exclude_boxes_from_param(value) -> Optional[np.ndarray]:
@@ -106,6 +123,74 @@ def exclude_boxes_from_param(value) -> Optional[np.ndarray]:
     lo = np.minimum(boxes[:, :3], boxes[:, 3:])
     hi = np.maximum(boxes[:, :3], boxes[:, 3:])
     return np.concatenate((lo, hi), axis=1)
+
+
+def snap_voxel_dims(dims: Sequence[float], pitch: float, max_cells: int = 4_000_000) -> Tuple[float, float, float]:
+    """把盒子边长收成 pitch 的整数倍，和 cuRobo 格子索引对齐。"""
+    pitch = float(pitch)
+    if pitch <= 0.0:
+        raise ValueError(f"pointcloud_pitch 必须 > 0，收到 {pitch}")
+    snapped = []
+    cells = 1
+    for raw in dims:
+        n = int(round(float(raw) / pitch))
+        if n < 2:
+            raise ValueError(
+                f"体素盒子边长 {float(raw):.3f} m 相对 pitch={pitch:.3f} m 不足 2 格"
+            )
+        snapped.append(n * pitch)
+        cells *= n
+    if cells > int(max_cells):
+        raise ValueError(
+            f"体素格子共 {cells} 个，超过 {int(max_cells)}。"
+            f"加大 pointcloud_pitch 或缩小 pointcloud_voxel_dims"
+        )
+    return snapped[0], snapped[1], snapped[2]
+
+
+def points_to_esdf(
+    points: np.ndarray,
+    center: Sequence[float],
+    dims: Sequence[float],
+    pitch: float,
+    empty_distance: float = 5.0,
+) -> Tuple[np.ndarray, int]:
+    """点云写入固定格子，返回 ESDF（米）。内部为负，外部为正。
+
+    数组形状 (nx, ny, nz)，C 顺序，z 变化最快，与 cuRobo 的体素下标一致。
+    没有任何点落在盒子里时，整张表都是 empty_distance。
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    pitch = float(pitch)
+    dims_s = snap_voxel_dims(dims, pitch)
+    center_a = np.asarray(center, dtype=np.float64).reshape(3)
+    shape = tuple(int(round(d / pitch)) for d in dims_s)
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    occupied = np.zeros(shape, dtype=bool)
+    n_inside = 0
+    if pts.shape[0] > 0:
+        offset = np.asarray(shape, dtype=np.float64) * pitch * 0.5
+        ijk = np.floor((pts - center_a + offset) / pitch).astype(np.int64)
+        inside = (
+            (ijk[:, 0] >= 0)
+            & (ijk[:, 0] < shape[0])
+            & (ijk[:, 1] >= 0)
+            & (ijk[:, 1] < shape[1])
+            & (ijk[:, 2] >= 0)
+            & (ijk[:, 2] < shape[2])
+        )
+        n_inside = int(np.count_nonzero(inside))
+        if n_inside:
+            hit = ijk[inside]
+            occupied[hit[:, 0], hit[:, 1], hit[:, 2]] = True
+    if n_inside == 0:
+        esdf = np.full(shape, float(empty_distance), dtype=np.float32)
+        return esdf, 0
+    dist_to_occ = distance_transform_edt(~occupied)
+    dist_to_free = distance_transform_edt(occupied)
+    esdf = ((dist_to_occ - dist_to_free) * pitch).astype(np.float32)
+    return esdf, n_inside
 
 
 def drop_boxes(points: np.ndarray, boxes: Optional[np.ndarray]) -> np.ndarray:

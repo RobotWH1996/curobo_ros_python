@@ -101,6 +101,35 @@ def combine_joint_trajectories(
     return msg
 
 
+def trajectory_is_finite(traj: Optional[JointTrajectory]) -> bool:
+    """位置、速度、加速度都是有限数才可以下发。"""
+    if traj is None or not traj.points:
+        return False
+    for pt in traj.points:
+        values = list(pt.positions) + list(pt.velocities) + list(pt.accelerations)
+        if not values:
+            return False
+        if not np.isfinite(np.asarray(values, dtype=np.float64)).all():
+            return False
+    return True
+
+
+def copy_joint_trajectory(src: JointTrajectory) -> JointTrajectory:
+    out = JointTrajectory()
+    out.joint_names = list(src.joint_names)
+    out.header.frame_id = src.header.frame_id
+    out.header.stamp = src.header.stamp
+    for src_pt in src.points:
+        pt = JointTrajectoryPoint()
+        pt.positions = list(src_pt.positions)
+        pt.velocities = list(src_pt.velocities)
+        pt.accelerations = list(src_pt.accelerations)
+        pt.effort = list(src_pt.effort)
+        pt.time_from_start = src_pt.time_from_start
+        out.points.append(pt)
+    return out
+
+
 def _point_time(pt: JointTrajectoryPoint) -> float:
     return float(pt.time_from_start.sec) + float(pt.time_from_start.nanosec) * 1e-9
 

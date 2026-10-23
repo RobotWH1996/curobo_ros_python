@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from typing import Optional, Tuple
 
+import numpy as np
+
 from geometry_msgs.msg import PoseStamped
 from tf2_ros import TransformException
 
@@ -24,6 +26,7 @@ class MpcFollower:
     def __init__(self, node):
         self._node = node
         self._mpc = None
+        self._cache = {}
         self._lock_key = None
         self._target: Optional[MpcTarget] = None
         self._joint_vel = {}
@@ -31,6 +34,8 @@ class MpcFollower:
         self._last_joint_t = None
         self._last_warn_left = 0.0
         self._last_warn_right = 0.0
+        self._cloud_note = ""
+        self._loaded_pc_seq = None
 
     def on_target(self, msg: MpcTarget):
         self._target = msg
@@ -84,14 +89,27 @@ class MpcFollower:
         return extra
 
     def ensure(self, extra_lock_names=None):
+        """取出该模式的求解器。每种模式只在第一次创建，之后锁定关节变了也不重建。"""
         extra_lock_names = list(extra_lock_names or [])
-        key = tuple(extra_lock_names)
+        key = tuple(sorted(extra_lock_names))
         if self._mpc is not None and self._lock_key == key:
             return self._mpc
         from curobo_ros_python.planning.algorithms.mpc import DualArmMpc
 
         node = self._node
+        cached = self._cache.get(key)
+        if cached is not None:
+            switched = self._mpc is not cached
+            if switched:
+                self._loaded_pc_seq = None
+                cached.forget_command()
+            self._mpc = cached
+            self._lock_key = key
+            if switched:
+                self.reset()
+            return cached
         node.get_logger().info("正在创建 ModelPredictiveControl（首次较慢）...")
+        joint_map = dict(node._joint_map)
         self._mpc = DualArmMpc(
             robot=node._robot_yaml,
             device=str(node._p("mpc_device") or "cuda:0"),
@@ -102,17 +120,66 @@ class MpcFollower:
             posture=str(node._p("mpc_posture") or "l"),
             warm_start_iters=int(node._p("mpc_warm_start_iters")),
             cold_start_iters=int(node._p("mpc_cold_start_iters")),
-            lock_joint_values=dict(node._joint_map),
+            num_control_points=int(node._p("mpc_num_control_points")),
+            lock_joint_values=joint_map,
             extra_lock_names=extra_lock_names,
             logger=node.get_logger(),
         )
         self._lock_key = key
+        self._cache[key] = self._mpc
+        # 序号记的是上一份求解器。新实例的碰撞场景是空的，必须重新加载当前帧。
+        self._loaded_pc_seq = None
         return self._mpc
+
+    def prewarm_next(self, modes) -> bool:
+        """每次只预热一个模式。调用者持有节点 GPU 锁；订阅回调继续收状态。"""
+        node = self._node
+        needed = set(GROUP_JOINTS.get("both_arms") or [])
+        if not needed or not needed.issubset(node._joint_map):
+            return False
+        if node.use_pointcloud and node.pointcloud_topic:
+            with node._pc_lock:
+                if node._pc_msg is None:
+                    return False
+        locks = {
+            "left_arm": GROUP_JOINTS["right_arm"],
+            "right_arm": GROUP_JOINTS["left_arm"],
+            "both_arms": [],
+        }
+        for mode in modes:
+            key = tuple(sorted(locks[mode]))
+            cached = self._cache.get(key)
+            if cached is not None and cached.prewarmed:
+                continue
+            started = time.monotonic()
+            mpc = self.ensure(locks[mode])
+            error = self._sync_world(mpc, publish=False)
+            if error:
+                node.get_logger().warn(f"MPC 预热等待点云：{error}", throttle_duration_sec=5.0)
+                return False
+            current, missing = joint_map_to_curobo(
+                mpc.joint_names, dict(node._joint_map), mpc.device_cfg.device,
+                default_position=mpc.default_joint_position, joint_vel=dict(self._joint_vel),
+            )
+            if missing:
+                return False
+            mpc.warmup(current, mode)
+            node.get_logger().info(
+                f"MPC {mode} 预热完成，耗时 {time.monotonic() - started:.2f}s（未下发运动）"
+            )
+            return False
+        return True
 
     def reset(self):
         """每次 follow_mpc 开始时调用：丢掉上一轮的命令接力状态。"""
         if self._mpc is not None:
-            self._mpc.forget_command()
+            current, _ = joint_map_to_curobo(
+                self._mpc.joint_names, dict(self._node._joint_map), self._mpc.device_cfg.device,
+                default_position=self._mpc.default_joint_position, joint_vel=dict(self._joint_vel),
+            )
+            self._mpc.prepare_tracking(current)
+            # 即使点云序号没变，也重新应用最新 TF；预热场景不直接用于跟踪。
+            self._loaded_pc_seq = None
 
     def _arm_target_stamped(self, has_flag: bool, pose: PoseStamped) -> Optional[PoseStamped]:
         if has_flag:
@@ -135,14 +202,19 @@ class MpcFollower:
             return now
         return last_ts
 
-    def _sync_world(self, mpc) -> Optional[str]:
+    def _sync_world(self, mpc, publish: bool = True) -> Optional[str]:
         node = self._node
+        self._cloud_note = ""
         if not node.use_pointcloud or not node.pointcloud_topic:
             return None
         with node._pc_lock:
             msg = node._pc_msg
+            seq = int(node._pc_seq)
         if msg is None:
             return f"无点云：尚未收到 {node.pointcloud_topic}"
+        if seq == self._loaded_pc_seq:
+            self._cloud_note = f"点云未更新 seq={seq}"
+            return None
         src = (msg.header.frame_id or "").lstrip("/")
         try:
             translation, quat_wxyz = node._lookup_cloud_tf(src)
@@ -158,17 +230,32 @@ class MpcFollower:
                 pitch=node.pointcloud_pitch,
                 max_points=node.pointcloud_max_points,
                 filter_cloud=node.filter_pointcloud,
+                bounds_min=node.pointcloud_bounds_min,
+                bounds_max=node.pointcloud_bounds_max,
             )
         except Exception as exc:  # noqa: BLE001
             return f"解析点云失败: {exc}"
         if pts.shape[0] == 0:
-            return "无点云：点云为空，未更新碰撞场景"
+            self._clear_loaded_world(mpc, seq, "这一帧没有可用点", publish=publish)
+            return None
         pts = drop_boxes(pts, node.static_exclude_boxes())
         if pts.shape[0] == 0:
-            return "无点云：去掉固定夹爪盒子后为空，未更新碰撞场景"
+            self._clear_loaded_world(mpc, seq, "去掉固定夹爪盒子后没有点", publish=publish)
+            return None
+        self._cloud_note = _cloud_grid_note(pts, node.pointcloud_pitch)
         mpc.update_world_from_points(pts, pitch=node.pointcloud_pitch)
-        publish_collision_world(node, pts)
+        if publish:
+            publish_collision_world(node, pts)
+        self._loaded_pc_seq = seq
         return None
+
+    def _clear_loaded_world(self, mpc, seq: int, reason: str, publish: bool = True) -> None:
+        """这一帧已经解析成功，只是没有障碍。清掉旧网格，别把它当成传感器失效。"""
+        mpc.clear_world()
+        if publish:
+            publish_collision_world(self._node, np.zeros((0, 3), dtype=np.float32))
+        self._loaded_pc_seq = seq
+        self._cloud_note = f"点云 n=0 seq={seq} {reason}，已清除碰撞网格"
 
     def tick(self) -> Tuple[MpcPlan, FollowMpc.Feedback]:
         node = self._node
@@ -256,8 +343,29 @@ class MpcFollower:
             joint_names=mpc.joint_names,
         )
         lap("pack")
-        node.get_logger().info(
-            "MPC tick 分段(ms): " + " ".join(f"{k}={v:.1f}" for k, v in laps.items()),
-            throttle_duration_sec=2.0,
-        )
+        timing = "MPC tick 分段(ms): " + " ".join(f"{k}={v:.1f}" for k, v in laps.items())
+        if self._cloud_note:
+            timing = f"{timing} {self._cloud_note}"
+        node.get_logger().info(timing, throttle_duration_sec=2.0)
         return out, fb
+
+
+def _cloud_grid_note(pts, pitch: float) -> str:
+    """和 Mesh.from_pointcloud 同一张格子：包围盒有多大，CPU 数组就有多少格。"""
+    arr = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+    keep = np.isfinite(arr).all(axis=1)
+    arr = arr[keep]
+    if arr.shape[0] == 0:
+        return "点云 n=0"
+    lo = arr.min(axis=0)
+    span = arr.max(axis=0) - lo
+    pitch = max(float(pitch), 1e-4)
+    ijk = np.floor((arr - (lo - pitch)) / pitch).astype(np.int64)
+    cells = ijk.max(axis=0) + 3
+    n_cells = int(cells[0]) * int(cells[1]) * int(cells[2])
+    far = float(np.linalg.norm(arr, axis=1).max())
+    return (
+        f"点云 n={arr.shape[0]} far={far:.2f}m "
+        f"span=({span[0]:.2f},{span[1]:.2f},{span[2]:.2f})m "
+        f"cells={int(cells[0])}x{int(cells[1])}x{int(cells[2])}={n_cells}"
+    )

@@ -18,8 +18,10 @@ from curobo.scene import Mesh, Scene
 from curobo.types import DeviceCfg, GoalToolPose, JointState, Pose
 
 from curobo_ros_python.planning.algorithms.common import (
+    pop_cached_mesh,
     pose_error,
     pose_xyz_wxyz,
+    restore_cached_mesh,
     robot_cfg_with_locked_joints,
     squeeze_pose,
 )
@@ -117,6 +119,7 @@ class DualArmMpc:
         posture: str = "l",
         warm_start_iters: int = 50,
         cold_start_iters: int = 100,
+        num_control_points: int = 6,
         lock_joint_values: Optional[Dict[str, float]] = None,
         extra_lock_names: Optional[Sequence[str]] = None,
         logger=None,
@@ -130,6 +133,11 @@ class DualArmMpc:
         self.cold_start_iters = max(
             self.warm_start_iters, _multiple_of(cold_start_iters, 25)
         )
+        self.num_control_points = int(num_control_points)
+        if self.num_control_points <= 5:
+            raise ValueError(
+                f"mpc_num_control_points 必须是大于 5 的整数，收到 {num_control_points}"
+            )
         self._warn_at: Dict[str, float] = {}
         self.set_posture(posture)
         self.device_cfg = DeviceCfg(device=torch.device(device), dtype=torch.float32)
@@ -138,6 +146,11 @@ class DualArmMpc:
         robot_cfg, self.locked_joints = robot_cfg_with_locked_joints(
             robot, lock_joint_values, extra_lock_names=extra_lock_names
         )
+        # 共用配置工具保留 YAML 的固定值；MPC 缓存必须对应创建时的实测几何。
+        for name in self.locked_joints:
+            if lock_joint_values is not None and name in lock_joint_values:
+                self.locked_joints[name] = float(lock_joint_values[name])
+        robot_cfg["robot_cfg"]["kinematics"]["lock_joints"].update(self.locked_joints)
         cfg = ModelPredictiveControlCfg.create(
             robot=robot_cfg,
             scene_model=None,
@@ -151,6 +164,7 @@ class DualArmMpc:
             # 下发的是前几个 knot。默认 0.001 时它们几乎感觉不到末端代价，
             # 加速度惩罚 10000 会把 15 cm 台阶压成几乎不动。
             non_terminal_tool_pose_weight_factor=0.05,
+            num_control_points=self.num_control_points,
         )
         # scene_model 为空时 cuRobo 会丢掉 collision_cache，检查器不会被创建。
         # 点云要靠 load_collision_model 装进去，所以这里按 TrajOpt 的方式补一个空场景。
@@ -176,6 +190,7 @@ class DualArmMpc:
                 f"MPC tool_frames={self.mpc.tool_frames} 缺少 {missing}，无法双臂跟踪"
             )
         self._setup_done = False
+        self.prewarmed = False
         self._last_goal_key = None
         self._cmd_vel_seq = None
         self._cmd_acc_seq = None
@@ -190,6 +205,7 @@ class DualArmMpc:
             f"posture_weight={self.posture_weight:g}，"
             f"warm_iters={self.warm_start_iters} cold_iters={self.cold_start_iters} "
             f"nonterminal_pose={cfg.non_terminal_tool_pose_weight_factor:g}，"
+            f"control_points={self.num_control_points}，"
             f"规划关节 {len(self.joint_names)} 个"
         )
         if self.locked_joints:
@@ -274,14 +290,57 @@ class DualArmMpc:
         self._cmd_stamp = None
         self._cmd_skip = 0.0
 
+    def prepare_tracking(self, current_state: JointState) -> None:
+        """从实测状态重新播种，保留已捕获的 CUDA Graph，不沿用旧命令。"""
+        self.forget_command()
+        self._last_goal_key = None
+        if self._setup_done:
+            self.mpc.reset_robot(current_state.clone())
+
+    def warmup(self, current_state: JointState, mode: str) -> None:
+        """预热冷/热求解路径；结果不交给执行器。"""
+        self._ensure_setup(current_state)
+        poses = self.fk_tool_poses(current_state)
+        left = poses[self.left_ee] if mode != "right_arm" else None
+        right = poses[self.right_ee] if mode != "left_arm" else None
+        self.run(current_state.clone(), left, right)
+        self.run(current_state.clone(), left, right)
+        torch.cuda.synchronize(self.device_cfg.device)
+        self.prepare_tracking(current_state)
+        self.prewarmed = True
+
     def update_world_from_points(self, points: np.ndarray, pitch: float, name: str = "cam") -> int:
         pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
         mesh = Mesh.from_pointcloud(pts, pitch=float(pitch), name=name or "cam")
         checker = self.mpc.core.scene_collision_checker
         if checker is None:
             raise RuntimeError("MPC 没有 scene collision checker，无法更新点云环境")
-        checker.load_collision_model(Scene(mesh=[mesh]))
+        # 同名缓存会留住第一帧。先取出；成功后再释放旧 BVH。
+        # 失败时底层已经清空场景槽，必须把旧网格写回去，不能只留在本地变量里。
+        old = pop_cached_mesh(checker, mesh.name)
+        try:
+            checker.load_collision_model(Scene(mesh=[mesh]))
+        except Exception:
+            restore_cached_mesh(checker, mesh.name, old)
+            raise
+        finally:
+            del old
         return int(pts.shape[0])
+
+    def clear_world(self, name: str = "cam") -> None:
+        """去掉当前碰撞网格。用于一帧有效点云里已经没有障碍。"""
+        checker = self.mpc.core.scene_collision_checker
+        if checker is None:
+            raise RuntimeError("MPC 没有 scene collision checker，无法清空碰撞场景")
+        mesh_name = name or "cam"
+        old = pop_cached_mesh(checker, mesh_name)
+        try:
+            checker.clear_cache()
+        except Exception:
+            restore_cached_mesh(checker, mesh_name, old)
+            raise
+        finally:
+            del old
 
     def fk_tool_poses(self, joint_state: JointState) -> Dict[str, Pose]:
         kin = self.mpc.compute_kinematics(joint_state.clone())

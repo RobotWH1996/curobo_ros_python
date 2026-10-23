@@ -47,8 +47,10 @@ from curobo_ros_python.planning.pointcloud import (
 )
 from curobo_ros_python.planning.trajectory import (
     TrajectoryExecutor,
+    copy_joint_trajectory,
     drop_passed_prefix,
     joint_map_from_msg,
+    trajectory_is_finite,
 )
 
 _PARAM_DEFAULTS: Dict[str, Any] = {
@@ -57,8 +59,12 @@ _PARAM_DEFAULTS: Dict[str, Any] = {
     "warmup_iterations": 3,
     "use_cuda_graph": True,
     "interpolation_dt": 0.02,
+    "trajopt_num_seeds": 2,
+    "trajopt_finetune_attempts": 1,
+    "trajopt_num_iters": 50,
     "position_tolerance": 0.005,
     "orientation_tolerance": 0.05,
+    "waypoint_joint_tolerance": 0.1,
     "trajopt_velocity_scale": 0.5,
     "mpc_velocity_scale": 0.5,
     "execute_trajectory": True,
@@ -75,11 +81,17 @@ _PARAM_DEFAULTS: Dict[str, Any] = {
     "visualize_mesh_obstacles": True,
     "visualize_goal_waypoints": True,
     "pointcloud_topic": "/camera/depth_registered/points",
+    "pointcloud_collision": "mesh",
+    "pointcloud_voxel_dims": [2.0, 2.0, 2.0],
+    "pointcloud_voxel_center": [0.2, 0.0, 1.0],
     "pointcloud_pitch": 0.02,
     "pointcloud_max_points": 40000,
     "pointcloud_min_range": 0.2,
     "pointcloud_max_range": 3.0,
     "filter_pointcloud": False,
+    # 躯干锁在 0 时，肩高 1.24 m、肩距 ±0.08 m，臂长 0.87 m，再留 0.18 m 给手。
+    "pointcloud_bounds_min": [0.00, -1.15, 0.20],
+    "pointcloud_bounds_max": [1.05, 1.15, 1.90],
     "pointcloud_exclude_boxes": "",
     "require_pointcloud": False,
     "pointcloud_parent_frame": "base_link",
@@ -92,6 +104,9 @@ _PARAM_DEFAULTS: Dict[str, Any] = {
     "mpc_posture": "l",
     "mpc_warm_start_iters": 50,
     "mpc_cold_start_iters": 100,
+    "mpc_num_control_points": 6,
+    "mpc_prewarm": True,
+    "mpc_prewarm_modes": ["left_arm", "right_arm", "both_arms"],
     "mpc_target_topic": "/curobo/target",
     "mpc_plan_topic": "/curobo/mpc_plan",
     "mpc_missing_target_warn_period": 2.0,
@@ -179,6 +194,31 @@ class CuroboMotionPlanningNode(Node):
             f"目标路点 {'开' if self.visualize_goal_waypoints else '关'}，"
             f"仿真/调试执行 {'开' if self.execute_trajectory else '关'}"
         )
+        self.pointcloud_collision = self._collision_mode()
+        self.pointcloud_voxel_dims, self.pointcloud_voxel_center = self._voxel_box()
+        collision_cache = None
+        if self.pointcloud_collision == "voxel":
+            from curobo_ros_python.planning.pointcloud import snap_voxel_dims
+
+            snapped = snap_voxel_dims(self.pointcloud_voxel_dims, self._p("pointcloud_pitch"))
+            self.pointcloud_voxel_dims = list(snapped)
+            collision_cache = {
+                "mesh": 1,
+                "voxel": {
+                    "layers": 1,
+                    "dims": self.pointcloud_voxel_dims,
+                    "voxel_size": float(self._p("pointcloud_pitch")),
+                },
+            }
+            self.get_logger().info(
+                "TrajOpt 点云碰撞: voxel（ESDF），"
+                f"dims={tuple(round(v, 3) for v in self.pointcloud_voxel_dims)} m，"
+                f"center={tuple(round(v, 3) for v in self.pointcloud_voxel_center)} m，"
+                f"pitch={float(self._p('pointcloud_pitch')):.3f} m"
+            )
+        else:
+            self.get_logger().info("TrajOpt 点云碰撞: mesh")
+        self._world_timing = {"cloud": 0.0, "scene": 0.0}
         self.planner = CuroboPlanner(
             robot=robot_yaml,
             scene_model=self._p("scene_model") or None,
@@ -187,6 +227,11 @@ class CuroboMotionPlanningNode(Node):
             interpolation_dt=self._p("interpolation_dt"),
             position_tolerance=self._p("position_tolerance"),
             orientation_tolerance=self._p("orientation_tolerance"),
+            waypoint_joint_tolerance=self._p("waypoint_joint_tolerance"),
+            collision_cache=collision_cache,
+            num_trajopt_seeds=int(self._p("trajopt_num_seeds")),
+            trajopt_num_iters=int(self._p("trajopt_num_iters")),
+            finetune_attempts=int(self._p("trajopt_finetune_attempts")),
             logger=self.get_logger(),
         )
         self.executor_helper = None
@@ -197,6 +242,9 @@ class CuroboMotionPlanningNode(Node):
 
         self._joint_map: Dict[str, float] = {}
         self._mpc_following = False
+        self._mpc_preparing = False
+        self._mpc_ready_logged = False
+        self._last_mpc_command: Optional[Tuple[Optional[JointTrajectory], Optional[JointTrajectory]]] = None
         self._mpc = MpcFollower(self)
         self.create_subscription(
             JointState,
@@ -277,6 +325,24 @@ class CuroboMotionPlanningNode(Node):
             cancel_callback=self._follow_mpc_cancel,
             callback_group=self._action_group,
         )
+        self._mpc_prewarm_timer = None
+        self._initialization_logged = False
+        if bool(self._p("mpc_prewarm")):
+            modes = list(self._p("mpc_prewarm_modes"))
+            if not modes or any(mode not in ("left_arm", "right_arm", "both_arms") for mode in modes):
+                raise ValueError("mpc_prewarm_modes 必须包含 left_arm / right_arm / both_arms 中的模式")
+            self._mpc_prewarm_timer = self.create_timer(
+                1.0, self._prewarm_mpc, callback_group=self._service_group
+            )
+            self.get_logger().info(f"MPC 将在收到关节状态和点云后提前预热：{modes}")
+            self.get_logger().info("基础节点已启动，等待 MPC 预热完成...")
+        else:
+            self._log_initialization_complete()
+
+    def _log_initialization_complete(self) -> None:
+        if self._initialization_logged:
+            return
+        self._initialization_logged = True
         self.get_logger().info(
             "服务已就绪: plan_joint_goal / plan_pose_goal / compute_ik；"
             "Action: follow_mpc（目标 /curobo/target，结果 /curobo/mpc_plan）"
@@ -285,6 +351,24 @@ class CuroboMotionPlanningNode(Node):
 
     def _p(self, name: str):
         return self.get_parameter(name).value
+
+    def _collision_mode(self) -> str:
+        mode = str(self._p("pointcloud_collision") or "mesh").strip().lower()
+        if mode not in ("mesh", "voxel"):
+            raise ValueError(
+                f"pointcloud_collision 只能是 mesh 或 voxel，收到 {mode!r}"
+            )
+        return mode
+
+    def _vec3(self, name: str) -> list:
+        raw = self._p(name)
+        vals = [float(v) for v in list(raw)]
+        if len(vals) != 3:
+            raise ValueError(f"{name} 需要 3 个数，收到 {vals}")
+        return vals
+
+    def _voxel_box(self) -> tuple:
+        return self._vec3("pointcloud_voxel_dims"), self._vec3("pointcloud_voxel_center")
 
     def _setup_pointcloud(self):
         self.use_pointcloud = bool(self._p("use_pointcloud"))
@@ -295,6 +379,13 @@ class CuroboMotionPlanningNode(Node):
         self.pointcloud_min_range = self._p("pointcloud_min_range")
         self.pointcloud_max_range = self._p("pointcloud_max_range")
         self.filter_pointcloud = self._p("filter_pointcloud")
+        self.pointcloud_bounds_min = self._vec3("pointcloud_bounds_min")
+        self.pointcloud_bounds_max = self._vec3("pointcloud_bounds_max")
+        if any(lo >= hi for lo, hi in zip(self.pointcloud_bounds_min, self.pointcloud_bounds_max)):
+            raise ValueError(
+                "pointcloud_bounds_min 必须小于 pointcloud_bounds_max，收到 "
+                f"{self.pointcloud_bounds_min} / {self.pointcloud_bounds_max}"
+            )
         self.require_pointcloud = self._p("require_pointcloud")
         self.pointcloud_parent_frame = (
             self._p("pointcloud_parent_frame") or self.base_frame
@@ -302,6 +393,7 @@ class CuroboMotionPlanningNode(Node):
         self.pointcloud_child_frame = (self._p("pointcloud_child_frame") or "").lstrip("/")
         self._pc_lock = threading.Lock()
         self._pc_msg: Optional[PointCloud2] = None
+        self._pc_seq = 0
         self._last_world_pts = None
 
         if not self.use_pointcloud:
@@ -326,12 +418,17 @@ class CuroboMotionPlanningNode(Node):
         )
         child = self.pointcloud_child_frame or "header.frame_id"
         self.get_logger().info(
-            f"点云碰撞: 订阅 {self.pointcloud_topic}，规划前转 Mesh 并 update_world"
+            f"点云碰撞: 订阅 {self.pointcloud_topic}，"
+            f"TrajOpt 用 {self.pointcloud_collision}"
             f"（滤波 {'开' if self.filter_pointcloud else '关'}，"
-            f"Mesh 可视化 {'开' if self.visualize_mesh_obstacles else '关'}）"
+            f"体素可视化 {'开' if self.visualize_mesh_obstacles else '关'}）"
         )
+        lo = self.pointcloud_bounds_min
+        hi = self.pointcloud_bounds_max
         self.get_logger().info(
-            f"点云坐标系 {child} -> {self.pointcloud_parent_frame} 规划前查 TF"
+            f"点云坐标系 {child} -> {self.pointcloud_parent_frame} 规划前查 TF；"
+            f"只保留 base_link 盒子 "
+            f"x[{lo[0]:.2f},{hi[0]:.2f}] y[{lo[1]:.2f},{hi[1]:.2f}] z[{lo[2]:.2f},{hi[2]:.2f}] m"
         )
 
     def destroy_node(self):
@@ -352,6 +449,7 @@ class CuroboMotionPlanningNode(Node):
     def _on_pointcloud(self, msg: PointCloud2):
         with self._pc_lock:
             self._pc_msg = msg
+            self._pc_seq += 1
 
     def _pc_skip_or_fail(self, err: str, *, empty_scene_note: bool = False) -> Optional[str]:
         if self.require_pointcloud:
@@ -385,12 +483,43 @@ class CuroboMotionPlanningNode(Node):
             )
         return self._exclude_boxes
 
-    def _sync_world_from_pointcloud(self) -> Optional[str]:
+    def _mark_world_timing(self, started: float, scene_started: Optional[float] = None) -> None:
+        now = time.perf_counter()
+        if scene_started is None:
+            self._world_timing = {"cloud": now - started, "scene": 0.0}
+        else:
+            self._world_timing = {
+                "cloud": scene_started - started,
+                "scene": now - scene_started,
+            }
+
+    def _planning_timing_note(self, timer: _LapTimer) -> str:
+        world = self._world_timing
+        stages = getattr(self.planner, "last_timing", {}) or {}
+
+        def ms(source: Dict[str, float], key: str) -> float:
+            return float(source.get(key, 0.0)) * 1000.0
+
+        parts = (
+            f"cloud={ms(world, 'cloud'):.0f}ms "
+            f"scene={ms(world, 'scene'):.0f}ms "
+            f"ik={ms(stages, 'ik'):.0f}ms "
+            f"prm={ms(stages, 'prm'):.0f}ms "
+            f"trajopt={ms(stages, 'trajopt'):.0f}ms "
+            f"check={ms(stages, 'check'):.0f}ms "
+            f"wall={timer.total_ms():.0f}ms"
+        )
+        return f"计时 {parts}"
+
+    def _sync_world_from_pointcloud(self, group_name: Optional[str] = None) -> Optional[str]:
+        started = time.perf_counter()
         if not self.use_pointcloud or not self.pointcloud_topic:
+            self._world_timing = {"cloud": 0.0, "scene": 0.0}
             return None
         with self._pc_lock:
             msg = self._pc_msg
         if msg is None:
+            self._mark_world_timing(started)
             return self._pc_skip_or_fail(
                 f"尚未收到点云 {self.pointcloud_topic}，无法更新碰撞场景",
                 empty_scene_note=True,
@@ -404,6 +533,7 @@ class CuroboMotionPlanningNode(Node):
             err = (
                 f"没有 TF {child} -> {parent}，点云无法进规划坐标系。详情: {exc}"
             )
+            self._mark_world_timing(started)
             return self._pc_skip_or_fail(err, empty_scene_note=True)
         try:
             pts, n_raw = cloud_to_base_points(
@@ -415,8 +545,11 @@ class CuroboMotionPlanningNode(Node):
                 pitch=self.pointcloud_pitch,
                 max_points=self.pointcloud_max_points,
                 filter_cloud=self.filter_pointcloud,
+                bounds_min=self.pointcloud_bounds_min,
+                bounds_max=self.pointcloud_bounds_max,
             )
         except Exception as exc:  # noqa: BLE001
+            self._mark_world_timing(started)
             return self._pc_skip_or_fail(f"解析点云失败: {exc}")
         if pts.shape[0] == 0:
             empty_msg = (
@@ -424,13 +557,30 @@ class CuroboMotionPlanningNode(Node):
                 if self.filter_pointcloud
                 else "点云为空，未更新碰撞场景"
             )
+            self._mark_world_timing(started)
             return self._pc_skip_or_fail(empty_msg)
         pts = drop_boxes(pts, self.static_exclude_boxes())
         if pts.shape[0] == 0:
+            self._mark_world_timing(started)
             return self._pc_skip_or_fail("点云去掉固定夹爪盒子后为空，未更新碰撞场景")
-        n_used = self.planner.update_world_from_points(
-            pts, pitch=self.pointcloud_pitch, name="cam"
-        )
+        scene_started = time.perf_counter()
+        if self.pointcloud_collision == "voxel":
+            n_used, n_inside = self.planner.update_world_from_esdf(
+                pts,
+                pitch=self.pointcloud_pitch,
+                dims=self.pointcloud_voxel_dims,
+                center=self.pointcloud_voxel_center,
+            )
+            if n_inside == 0:
+                self.get_logger().warn(
+                    "点云全部落在 ESDF 盒子外，本次按盒子内无障碍规划",
+                    throttle_duration_sec=2.0,
+                )
+        else:
+            n_used = self.planner.update_world_from_points(
+                pts, pitch=self.pointcloud_pitch, name="cam", group_name=group_name
+            )
+        self._mark_world_timing(started, scene_started)
         self._last_world_pts = pts
         viz_note = ""
         from curobo_ros_python.visualization.publish import publish_collision_world
@@ -460,8 +610,34 @@ class CuroboMotionPlanningNode(Node):
             return "MPC 跟踪进行中，请先取消 /follow_mpc"
         return None
 
+    def _prewarm_mpc(self) -> None:
+        """空闲时串行预热三个模式，与 TrajOpt / FollowMpc 共用 GPU 锁。"""
+        with self._mpc_start_lock:
+            if self._mpc_following or not self._gpu_lock.acquire(blocking=False):
+                return
+            self._mpc_preparing = True
+        try:
+            ready = self._mpc.prewarm_next(self._p("mpc_prewarm_modes"))
+            if ready and not self._mpc_ready_logged:
+                self.get_logger().info("MPC ready：指定模式均已预热，可以启动 /follow_mpc")
+                self._log_initialization_complete()
+            self._mpc_ready_logged = ready
+            if ready and self._mpc_prewarm_timer is not None:
+                self._mpc_prewarm_timer.cancel()
+                self._mpc_prewarm_timer = None
+        except Exception as exc:  # noqa: BLE001
+            self._mpc_ready_logged = False
+            self.get_logger().error(f"MPC 提前预热失败，将重试：{exc}", throttle_duration_sec=5.0)
+        finally:
+            self._gpu_lock.release()
+            with self._mpc_start_lock:
+                self._mpc_preparing = False
+
     def _follow_mpc_goal(self, _request):
         with self._mpc_start_lock:
+            if self._mpc_preparing:
+                self.get_logger().warn("MPC 正在提前预热，请等待 MPC ready 后再启动跟踪")
+                return GoalResponse.REJECT
             if self._mpc_following:
                 self.get_logger().warn("已有 follow_mpc 在跑，拒绝新 Goal")
                 return GoalResponse.REJECT
@@ -499,6 +675,27 @@ class CuroboMotionPlanningNode(Node):
         right = plan.right.trajectory if plan.right.target_valid else None
         if left is None and right is None:
             return
+        finite = (left is None or trajectory_is_finite(left)) and (
+            right is None or trajectory_is_finite(right)
+        )
+        if not finite:
+            cached = self._last_mpc_command
+            if cached is None:
+                self.get_logger().warn(
+                    "本拍轨迹含 NaN，尚无有效轨迹，本拍不下发",
+                    throttle_duration_sec=2.0,
+                )
+                return
+            left, right = cached
+            self.get_logger().warn(
+                "本拍轨迹含 NaN，改下发上一拍有效轨迹",
+                throttle_duration_sec=2.0,
+            )
+        else:
+            self._last_mpc_command = (
+                None if left is None else copy_joint_trajectory(left),
+                None if right is None else copy_joint_trajectory(right),
+            )
         # 不要再把轨迹整体后移一个 knot：delay 等于 tick 时，
         # 第一个点永远在「下一拍」，每拍顶替后命令根本执行不到。
         # 第一个点已经在读数之后一个 knot。算得比这更慢时，丢掉超前的前缀，
@@ -556,6 +753,7 @@ class CuroboMotionPlanningNode(Node):
             from curobo_ros_python.visualization.publish import clear_trajopt_preview
 
             clear_trajopt_preview(self)
+            self._last_mpc_command = None
             self._mpc.ensure(self._mpc._unused_arm_joints())
             self._mpc.reset()
             while rclpy.ok() and goal_handle.is_active:
@@ -698,7 +896,9 @@ class CuroboMotionPlanningNode(Node):
 
     def _finish(self, group_name: str, planned: TrajResult, response, timer: Optional[_LapTimer] = None):
         response.success = planned.success
-        response.message = planned.message
+        note = self._planning_timing_note(timer) if timer is not None else ""
+        response.message = f"{planned.message}；{note}" if note else planned.message
+        planned.message = response.message
         if not planned.success:
             self.get_logger().error(f"规划失败 [{group_name}]: {planned.message}")
             if timer is not None:
@@ -713,7 +913,7 @@ class CuroboMotionPlanningNode(Node):
             planned.trajectory.position.reshape(-1, planned.trajectory.position.shape[-1]).shape[0]
         )
         self.get_logger().info(
-            f"规划成功 [{group_name}]: {planned.message}（{n_pts} 点, {planned.planning_time:.3f} s）"
+            f"规划成功 [{group_name}]: {planned.message}（{n_pts} 点）"
         )
         traj = curobo_traj_to_msg(
             planned.trajectory,
@@ -788,6 +988,8 @@ class CuroboMotionPlanningNode(Node):
                 f"收到 PlanJointGoal: group={request.group_name}, waypoints={len(request.waypoints)}"
             )
             timer = _LapTimer()
+            self._world_timing = {"cloud": 0.0, "scene": 0.0}
+            self.planner.last_timing = {}
             joints = GROUP_JOINTS[request.group_name]
             self._log_group_current(request.group_name)
             for i, wp in enumerate(request.waypoints):
@@ -805,11 +1007,13 @@ class CuroboMotionPlanningNode(Node):
                 ]
                 timer.lap("state")
                 self._publish_joint_goal_waypoints(request.group_name, goals)
-                pc_err = self._sync_world_from_pointcloud()
+                pc_err = self._sync_world_from_pointcloud(request.group_name)
                 timer.lap("world")
                 if pc_err:
                     self._log_laps("TrajOpt", request.group_name, timer)
-                    return self._reject(response, pc_err, log=True)
+                    return self._reject(
+                        response, f"{pc_err}；{self._planning_timing_note(timer)}", log=True
+                    )
                 planned = self.planner.plan_joint(
                     group_name=request.group_name,
                     current=current,
@@ -819,7 +1023,11 @@ class CuroboMotionPlanningNode(Node):
             except Exception as exc:  # noqa: BLE001
                 timer.lap("solve")
                 self._log_laps("TrajOpt", request.group_name, timer)
-                return self._reject(response, f"规划异常: {exc}", log=True)
+                return self._reject(
+                    response,
+                    f"规划异常: {exc}；{self._planning_timing_note(timer)}",
+                    log=True,
+                )
             self._finish(request.group_name, planned, response, timer)
             return response
         finally:
@@ -934,6 +1142,8 @@ class CuroboMotionPlanningNode(Node):
         )
         self._log_group_current(request.group_name)
         timer = _LapTimer()
+        self._world_timing = {"cloud": 0.0, "scene": 0.0}
+        self.planner.last_timing = {}
         viz_published = False
         try:
             waypoints, viz_items, err = self._build_pose_waypoints(request, other, other_ee)
@@ -944,11 +1154,13 @@ class CuroboMotionPlanningNode(Node):
             if err:
                 self._log_laps("TrajOpt", request.group_name, timer)
                 return self._reject(response, err, log=True)
-            pc_err = self._sync_world_from_pointcloud()
+            pc_err = self._sync_world_from_pointcloud(request.group_name)
             timer.lap("world")
             if pc_err:
                 self._log_laps("TrajOpt", request.group_name, timer)
-                return self._reject(response, pc_err, log=True)
+                return self._reject(
+                    response, f"{pc_err}；{self._planning_timing_note(timer)}", log=True
+                )
             planned = self.planner.plan_pose(
                 group_name=request.group_name,
                 current=self._current_curobo_state(),
@@ -960,7 +1172,11 @@ class CuroboMotionPlanningNode(Node):
             if not viz_published:
                 self._publish_goal_waypoints(self._raw_goal_items(request))
             self._log_laps("TrajOpt", request.group_name, timer)
-            return self._reject(response, f"规划异常: {exc}", log=True)
+            return self._reject(
+                response,
+                f"规划异常: {exc}；{self._planning_timing_note(timer)}",
+                log=True,
+            )
         self._finish(request.group_name, planned, response, timer)
         return response
 
@@ -978,7 +1194,7 @@ class CuroboMotionPlanningNode(Node):
             self._log_group_current(request.group_name)
             timer = _LapTimer()
             try:
-                pc_err = self._sync_world_from_pointcloud()
+                pc_err = self._sync_world_from_pointcloud(request.group_name)
                 timer.lap("world")
                 if pc_err:
                     self._log_laps("IK", request.group_name, timer)
@@ -1012,4 +1228,3 @@ class CuroboMotionPlanningNode(Node):
             return response
         finally:
             self._gpu_lock.release()
-
