@@ -135,6 +135,7 @@ class MpcFollower:
         """每次只预热一个模式。调用者持有节点 GPU 锁；订阅回调继续收状态。"""
         node = self._node
         needed = set(GROUP_JOINTS.get("both_arms") or [])
+        needed.update(node.planner.gripper_joint_names)
         if not needed or not needed.issubset(node._joint_map):
             return False
         if node.use_pointcloud and node.pointcloud_topic:
@@ -153,6 +154,7 @@ class MpcFollower:
                 continue
             started = time.monotonic()
             mpc = self.ensure(locks[mode])
+            mpc.update_gripper_state(dict(node._joint_map))
             error = self._sync_world(mpc, publish=False)
             if error:
                 node.get_logger().warn(f"MPC 预热等待点云：{error}", throttle_duration_sec=5.0)
@@ -173,6 +175,7 @@ class MpcFollower:
     def reset(self):
         """每次 follow_mpc 开始时调用：丢掉上一轮的命令接力状态。"""
         if self._mpc is not None:
+            self._mpc.update_gripper_state(dict(self._node._joint_map))
             current, _ = joint_map_to_curobo(
                 self._mpc.joint_names, dict(self._node._joint_map), self._mpc.device_cfg.device,
                 default_position=self._mpc.default_joint_position, joint_vel=dict(self._joint_vel),
@@ -269,9 +272,12 @@ class MpcFollower:
             t_lap = now
 
         mpc = self.ensure(self._unused_arm_joints())
+        # 夹爪不在 mpc.joint_names 中，必须独立刷新，不能靠 active state 带入。
+        joint_map = dict(node._joint_map)
+        mpc.update_gripper_state(joint_map)
         current, missing = joint_map_to_curobo(
             mpc.joint_names,
-            node._joint_map,
+            joint_map,
             mpc.device_cfg.device,
             default_position=mpc.default_joint_position,
             joint_vel=self._joint_vel,

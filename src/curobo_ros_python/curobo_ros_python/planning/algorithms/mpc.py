@@ -26,6 +26,7 @@ from curobo_ros_python.planning.algorithms.common import (
     squeeze_pose,
 )
 from curobo_ros_python.planning.groups import both_arm_ee_links
+from curobo_ros_python.planning.gripper import GripperStateUpdater
 
 # 左臂 7 关节再右臂 7 关节，与 lycus cspace 顺序一致。躯干不在表里，仍用默认 0。
 # 肘在上，肩离限位留余量，腕关节放在 0，避免 joint_5 顶到 ±3.107。
@@ -174,6 +175,7 @@ class DualArmMpc:
                 cache={"mesh": 1},
             )
         self.mpc = ModelPredictiveControl(cfg)
+        self._gripper_state = GripperStateUpdater.from_robot(robot)
         # 默认只下发 4 个点、0.105 s。点云那拍会到 0.3 s，指令先跑完，控制器停住再起步就是抖。
         # 多下发已经规划好的插值点，盖住 0.50 s。knot 步长和加速度惩罚不动。
         mgr = self.mpc.trajectory_execution_manager
@@ -213,6 +215,22 @@ class DualArmMpc:
                 "已锁定（不参与 MPC，也不下发）: "
                 + ", ".join(f"{k}={v:.3f}" for k, v in self.locked_joints.items())
             )
+
+    def update_gripper_state(self, joint_map: Dict[str, float]) -> None:
+        """每拍读取夹爪反馈并原地更新几何，不重建 MPC 或重新预热。"""
+        if not self._gripper_state.joint_names:
+            return
+        models = [self.mpc.kinematics]
+        # run_ik 模式使用独立 IK 求解器，也必须看到当前夹爪几何。
+        for core in (self.mpc.core, self.mpc.ik_solver.core):
+            rollouts = list(core.get_all_rollout_instances(
+                include_optimizer_rollouts=True, include_auxiliary_rollout=True
+            ))
+            rollouts.extend((getattr(core, "additional_metrics_rollouts", None) or {}).values())
+            models.extend(rollout.transition_model.robot_model for rollout in rollouts)
+        self._gripper_state.update(joint_map, models)
+        for name in self._gripper_state.joint_names:
+            self.locked_joints[name] = float(joint_map[name])
 
     def _info(self, msg: str):
         if self._log is not None:

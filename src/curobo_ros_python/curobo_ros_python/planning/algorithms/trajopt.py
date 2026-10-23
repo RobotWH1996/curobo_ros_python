@@ -30,6 +30,7 @@ from curobo_ros_python.planning.groups import (
     resolve_ee_link,
     unknown_group,
 )
+from curobo_ros_python.planning.gripper import GripperStateUpdater
 
 
 @dataclass
@@ -216,7 +217,7 @@ def _robot_models(planner: MotionPlanner) -> List[Any]:
         transforms = getattr(kin, "fixed_transforms", None)
         if transforms is None:
             return
-        key = id(transforms)
+        key = id(robot)
         if key in seen:
             return
         seen.add(key)
@@ -227,6 +228,7 @@ def _robot_models(planner: MotionPlanner) -> List[Any]:
         if transition is not None:
             add(getattr(transition, "robot_model", None))
 
+    add(planner.kinematics)
     for solver in (planner.ik_solver, planner.trajopt_solver):
         core = getattr(solver, "core", None)
         if core is None:
@@ -331,6 +333,7 @@ class CuroboPlanner:
             f"TrajOpt: seeds={seeds}, finetune_attempts={finetune}, num_iters={iters}"
         )
         urdf_joints = _urdf_joint_table(self._urdf_path(robot))
+        self._gripper_state = GripperStateUpdater(self._urdf_path(robot))
         self._planners: Dict[str, MotionPlanner] = {}
         self._locked: Dict[str, List[_LockedJoint]] = {}
         self._models: Dict[str, List[Any]] = {}
@@ -386,13 +389,11 @@ class CuroboPlanner:
         return f"{active}求解器: 锁住{other} {len(idle)} 个关节"
 
     def _build_motion(self, group_name: str, idle: Sequence[str]) -> MotionPlanner:
-        robot: Any = self._robot
-        if idle:
-            robot, _locks = robot_cfg_with_locked_joints(
-                self._robot,
-                {name: _LOCK_SENTINEL for name in idle},
-                idle,
-            )
+        robot, _locks = robot_cfg_with_locked_joints(
+            self._robot,
+            {name: _LOCK_SENTINEL for name in idle},
+            idle,
+        )
         cfg = MotionPlannerCfg.create(
             robot=robot,
             scene_model=self._scene_model,
@@ -407,6 +408,20 @@ class CuroboPlanner:
         motion = MotionPlanner(cfg)
         motion.waypoint_joint_tolerance = self._joint_tol
         return motion
+
+    @property
+    def gripper_joint_names(self) -> Tuple[str, ...]:
+        return self._gripper_state.joint_names
+
+    def update_gripper_state(self, joint_map: Dict[str, float]) -> None:
+        """每次规划/IK 前更新实测夹爪；不改变活动关节和 CUDA Graph。"""
+        if not self.gripper_joint_names:
+            return
+        models = [model for motion in self._planners.values() for model in _robot_models(motion)]
+        if self._gripper_state.update(joint_map, models):
+            for motion in self._planners.values():
+                if motion.graph_planner is not None:
+                    motion.graph_planner.reset_buffer()
 
     def _require_same_kinematics(self, group_name: str, motion: MotionPlanner, models: Sequence[Any]) -> None:
         ref = motion.kinematics.config.kinematics_config.fixed_transforms.detach()

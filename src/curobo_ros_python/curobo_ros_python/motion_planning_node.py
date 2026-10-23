@@ -882,9 +882,11 @@ class CuroboMotionPlanningNode(Node):
         self.get_logger().info(f"{kind} [{group_name}] 分段(ms): {timer.summary()}")
 
     def _current_curobo_state(self):
+        joint_map = dict(self._joint_map)
+        self.planner.update_gripper_state(joint_map)
         current, missing = joint_map_to_curobo(
             self.planner.joint_names,
-            self._joint_map,
+            joint_map,
             self.planner.device,
             default_position=self.planner.default_joint_position,
         )
