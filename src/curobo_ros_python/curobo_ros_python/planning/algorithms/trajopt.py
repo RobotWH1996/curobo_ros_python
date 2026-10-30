@@ -6,9 +6,10 @@
 from __future__ import annotations
 
 import math
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -26,11 +27,15 @@ from curobo_ros_python.planning.algorithms.common import (
 from curobo_ros_python.planning.groups import (
     GROUP_JOINTS,
     apply_robot,
+    both_arm_ee_links,
     joints_for_ee,
     resolve_ee_link,
     unknown_group,
 )
-from curobo_ros_python.planning.gripper import GripperStateUpdater, MeasuredPostureUpdater
+from curobo_ros_python.planning.gripper import GripperStateUpdater
+from curobo_ros_python.planning.fixed_state import FixedJointStateUpdater
+from curobo_ros_python.planning.mesh_collision import MeshCollision, MeshCollisionChecker
+from curobo_ros_python.planning.ik_collision_filter import install_ik_filter
 
 
 @dataclass
@@ -334,7 +339,8 @@ class CuroboPlanner:
         )
         urdf_joints = _urdf_joint_table(self._urdf_path(robot))
         self._gripper_state = GripperStateUpdater(self._urdf_path(robot))
-        self._measured_posture = MeasuredPostureUpdater(self._urdf_path(robot))
+        self._fixed_state = FixedJointStateUpdater.from_robot(
+            robot, list(GROUP_JOINTS['both_arms']) + list(self._gripper_state.joint_names))
         self._planners: Dict[str, MotionPlanner] = {}
         self._locked: Dict[str, List[_LockedJoint]] = {}
         self._models: Dict[str, List[Any]] = {}
@@ -342,6 +348,8 @@ class CuroboPlanner:
         self._cloud_sig = None
         self._cloud_vertices = None
         self._cloud_faces = None
+        self._cloud_fcl_sig = None
+        self._cloud_fcl_scene = None
         self._cloud_loaded: Dict[str, Any] = {}
         self._locked_pose: Dict[str, Dict[str, float]] = {}
         self.last_timing: Dict[str, float] = {}
@@ -373,6 +381,65 @@ class CuroboPlanner:
             if idle:
                 self._locked_pose[group_name] = {name: 0.0 for name in idle}
         self.planner = self._planners["both_arms"]
+        self._mesh_checker = MeshCollisionChecker.from_robot(robot)
+        self._mesh_positions = {}
+        self._mesh_feedback = {}
+        self._mesh_scenes = {}
+        self.last_fcl_candidates = {}
+        for group, motion in self._planners.items():
+            scene_cfg = motion.config.scene_collision_cfg
+            scene = None if scene_cfg is None else scene_cfg.scene_model
+            self._mesh_scenes[group] = self._mesh_checker.prepare_scene(scene)
+            install_ik_filter(motion.ik_solver, self._check_mesh_candidate, self._report_mesh_candidates)
+        if self._mesh_checker.skipped_links:
+            self._warn(f"FCL: 以下配置连杆无 collision 几何: {self._mesh_checker.skipped_links}")
+        self._info("OPT: IK 候选已启用全机器人 FCL 自碰撞和环境碰撞筛选")
+
+    def _check_mesh_candidate(self, positions: Mapping[str, float]) -> Optional[MeshCollision]:
+        started = time.perf_counter()
+        values = dict(self._mesh_feedback)
+        values.update(self._mesh_positions)
+        values.update(positions)
+        try:
+            return self._mesh_checker.check(values)
+        finally:
+            self._fcl_candidate_ms = getattr(self, '_fcl_candidate_ms', 0.0) + (time.perf_counter() - started) * 1000
+
+    def _fcl_environment_label(self) -> str:
+        count = len(self._mesh_checker.environment)
+        return f"mesh障碍={count}" if count else "空场景（未检查环境障碍）"
+
+    def _report_mesh_candidates(self, checked: int, rejected: Sequence[MeshCollision]) -> None:
+        elapsed_ms = getattr(self, '_fcl_candidate_ms', 0.0)
+        self._fcl_candidate_ms = 0.0
+        self.last_fcl_candidates = {"checked": checked, "rejected": len(rejected), "elapsed_ms": elapsed_ms}
+        self._info(f"FCL IK筛选: 检查={checked}, 通过={checked - len(rejected)}, "
+                   f"剔除={len(rejected)}, FCL耗时={elapsed_ms:.2f}ms; "
+                   f"环境={self._fcl_environment_label()}" +
+                   ("; 无成功IK候选可检查" if checked == 0 else ""))
+        if rejected:
+            hit = rejected[0]
+            self._info(f"FCL IK 筛选: {checked} 个候选中剔除 {len(rejected)} 个; "
+                       f"首个碰撞={hit.kind}: {hit.first} / {hit.second}")
+
+    def _check_mesh_endpoint(self, state: JointState, label: str = "输出终点") -> Optional[str]:
+        started = time.perf_counter()
+        row = state.position.reshape(-1, state.position.shape[-1])[-1].detach().cpu().tolist()
+        previous_ms = getattr(self, '_fcl_candidate_ms', 0.0)
+        try:
+            hit = self._check_mesh_candidate(dict(zip(state.joint_names, row)))
+        except Exception as exc:
+            self._warn(f"FCL {label}: 检查异常，拒绝放行: {exc}")
+            raise
+        finally:
+            self._fcl_candidate_ms = previous_ms
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        detail = "自碰撞通过" if hit is None else f"碰撞={hit.kind}: {hit.first} / {hit.second}"
+        self._info(f"FCL {label}: {'通过' if hit is None else '拒绝'}, {detail}; "
+                   f"环境={self._fcl_environment_label()}, 耗时={elapsed_ms:.2f}ms")
+        if hit is None:
+            return None
+        return f"FCL 目标状态碰撞 ({hit.kind}): {hit.first} / {hit.second}"
 
     def _urdf_path(self, robot: str) -> str:
         from curobo.config_io import load_yaml
@@ -415,14 +482,16 @@ class CuroboPlanner:
         return self._gripper_state.joint_names
 
     def update_gripper_state(self, joint_map: Dict[str, float]) -> None:
-        """每次规划/IK 前更新实测躯干、头部和夹爪；仅手臂参与优化，不改变 CUDA Graph。"""
+        """同一反馈快照更新夹爪、躯干/头和 FCL；保留优化自由度和图地址。"""
         models = [model for motion in self._planners.values() for model in _robot_models(motion)]
-        posture_changed = self._measured_posture.update(joint_map, models)
         gripper_changed = self._gripper_state.update(joint_map, models)
-        if posture_changed or gripper_changed:
+        fixed_changed = self._fixed_state.update(joint_map, models)
+        if gripper_changed or fixed_changed:
             for motion in self._planners.values():
                 if motion.graph_planner is not None:
                     motion.graph_planner.reset_buffer()
+        self._mesh_feedback = {name: float(value) for name, value in joint_map.items()}
+        self._mesh_feedback.update(self._fixed_state.positions)
 
     def _require_same_kinematics(self, group_name: str, motion: MotionPlanner, models: Sequence[Any]) -> None:
         ref = motion.kinematics.config.kinematics_config.fixed_transforms.detach()
@@ -436,6 +505,9 @@ class CuroboPlanner:
     def _sync_locked_arm(self, group_name: str, current: JointState) -> MotionPlanner:
         motion = self._planners[group_name]
         self._motion = motion
+        self._mesh_positions = dict(zip(current.joint_names, current.position.reshape(-1).detach().cpu().tolist()))
+        self._mesh_checker.environment = self._mesh_scenes[group_name]
+        self.last_fcl_candidates = {}
         specs = self._locked.get(group_name) or []
         if not specs:
             return motion
@@ -493,6 +565,13 @@ class CuroboPlanner:
             self._cloud_sig = sig
             self._cloud_loaded = {}
         mesh_name = name or "cam"
+        if self._cloud_fcl_sig != (sig, mesh_name):
+            fcl_mesh = Mesh(name=mesh_name, pose=[0., 0., 0., 1., 0., 0., 0.],
+                            vertices=self._cloud_vertices, faces=self._cloud_faces)
+            fcl_scene = self._mesh_checker.prepare_scene(SceneCfg(mesh=[fcl_mesh]))
+            self._cloud_fcl_scene = fcl_scene
+            self._cloud_fcl_sig = (sig, mesh_name)
+        fcl_scene = self._cloud_fcl_scene
         for group in pending:
             motion = self._planners[group]
             mesh = Mesh(
@@ -511,6 +590,7 @@ class CuroboPlanner:
             finally:
                 del old
             self._cloud_loaded[group] = sig
+            self._mesh_scenes[group] = fcl_scene
         self._info(
             f"已用点云更新碰撞场景: {n} 点, pitch={pitch:.3f} m, "
             f"求解器={','.join(pending)}"
@@ -535,6 +615,12 @@ class CuroboPlanner:
         pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
         dims_s = snap_voxel_dims(dims, pitch)
         esdf, n_inside = points_to_esdf(pts, center, dims_s, pitch)
+        from curobo.scene import Mesh
+        low = np.asarray(center) - np.asarray(dims_s) / 2
+        high = low + np.asarray(dims_s)
+        inside = pts[((pts >= low) & (pts < high)).all(1)]
+        fcl_scene = self._mesh_checker.prepare_scene(Scene(mesh=[
+            Mesh.from_pointcloud(inside, pitch=pitch, name=name or "cam")])) if len(inside) else {}
         cx, cy, cz = (float(v) for v in center)
         feature = torch.from_numpy(np.ascontiguousarray(esdf))
         for motion in self._planners.values():
@@ -546,6 +632,7 @@ class CuroboPlanner:
                 feature_tensor=feature.clone(),
             )
             motion.update_world(Scene(voxel=[grid]))
+        self._mesh_scenes = {group: fcl_scene for group in self._planners}
         self._info(
             f"已用 ESDF 更新碰撞场景: 框内 {n_inside}/{int(pts.shape[0])} 点, "
             f"pitch={float(pitch):.3f} m, "
@@ -555,11 +642,7 @@ class CuroboPlanner:
         return int(pts.shape[0]), n_inside
 
     def update_world_from_voxel(self, voxel_grid) -> None:
-        from curobo.scene import Scene
-
-        for motion in self._planners.values():
-            motion.update_world(Scene(voxel=[voxel_grid]))
-        self._info("已用 ESDF VoxelGrid 更新碰撞场景")
+        raise ValueError("FCL 目标筛选需要原始点云/mesh，不能仅用 ESDF VoxelGrid 更新环境")
 
     @property
     def joint_names(self) -> List[str]:
@@ -598,9 +681,14 @@ class CuroboPlanner:
             print("WARN:", msg, flush=True)
 
     def _fail(self, message: str) -> TrajResult:
+        candidates = getattr(self, "last_fcl_candidates", {})
+        if candidates.get("checked", 0) and candidates.get("checked") == candidates.get("rejected"):
+            message += "；FCL 已剔除全部 IK 候选（目标状态自碰撞或环境碰撞）"
         return TrajResult(False, message)
 
     def _prepare(self, group_name: str, waypoints=None) -> Optional[TrajResult]:
+        self.last_fcl_candidates = {}
+        self._fcl_candidate_ms = 0.0
         err = unknown_group(group_name)
         if err:
             return self._fail(err)
@@ -627,6 +715,7 @@ class CuroboPlanner:
         self,
         current_state: JointState,
         pose_by_ee: Dict[str, Pose],
+        current_fk: Optional[Dict[str, Pose]] = None,
     ) -> Tuple[GoalToolPose, List[str]]:
         if not pose_by_ee:
             raise ValueError("没有末端目标")
@@ -636,7 +725,8 @@ class CuroboPlanner:
             raise ValueError(
                 f"末端 {missing} 不在 cuRobo tool_frames 中: {frames}"
             )
-        fk = self.fk_tool_poses(current_state)
+        needs_fk = any(name not in pose_by_ee for name in frames)
+        fk = (current_fk if current_fk is not None else self.fk_tool_poses(current_state)) if needs_fk else {}
         pose_dict = {}
         idle_frames = []
         for name in frames:
@@ -673,6 +763,9 @@ class CuroboPlanner:
             traj = self._expand_to_reference(traj, hold_state)
         if hold_state is not None and hold_joints:
             traj = _hold_named_joints(traj, hold_state, hold_joints)
+        collision_error = self._check_mesh_endpoint(traj)
+        if collision_error:
+            return self._fail(collision_error)
         extra = f", 路点数={n_wp}" if n_wp > 1 else ""
         n_pts = int(traj.position.reshape(-1, traj.position.shape[-1]).shape[0])
         msg = f"规划成功, 轨迹点数={n_pts}{extra}"
@@ -709,17 +802,20 @@ class CuroboPlanner:
             elif name in hold_map:
                 out[:, i] = hold_map[name]
         state = JointState.from_position(out, joint_names=ref)
-        if traj.velocity is not None:
-            vel = traj.velocity
-            while vel.ndim > 2:
-                vel = vel[0]
-            if vel.ndim == 1:
-                vel = vel.unsqueeze(0)
-            out_vel = vel.new_zeros(out.shape)
+        for field in ("velocity", "acceleration", "jerk"):
+            values = getattr(traj, field, None)
+            if values is None:
+                setattr(state, field, None)
+                continue
+            while values.ndim > 2:
+                values = values[0]
+            if values.ndim == 1:
+                values = values.unsqueeze(0)
+            expanded = values.new_zeros(out.shape)
             for i, name in enumerate(ref):
-                if name in src and src[name] < vel.shape[-1]:
-                    out_vel[:, i] = vel[:, src[name]]
-            state.velocity = out_vel
+                if name in src and src[name] < values.shape[-1]:
+                    expanded[:, i] = values[:, src[name]]
+            setattr(state, field, expanded)
         return state
 
     def _from_single_result(
@@ -778,10 +874,15 @@ class CuroboPlanner:
         bad = self._prepare(group_name, waypoints)
         if bad:
             return bad
+        if group_name == "both_arms":
+            required = set(both_arm_ee_links())
+            if any(set(poses) != required for poses in waypoints):
+                return self._fail("both_arms 的每个位姿路点必须同时提供左右臂目标；单臂目标请使用 left_arm 或 right_arm")
         motion = self._sync_locked_arm(group_name, current)
         active = self._active(current)
         goals = []
         idle_joints: List[str] = []
+        current_fk = None
         for pose_by_ee in waypoints:
             pose_by_ee = dict(pose_by_ee)
             if len(pose_by_ee) == 1:
@@ -790,7 +891,9 @@ class CuroboPlanner:
                     return self._fail(err)
                 if ee not in pose_by_ee:
                     pose_by_ee = {ee: pose_by_ee[next(iter(pose_by_ee))]}
-            goal, idle_joints = self._goal_for_ee_poses(current, pose_by_ee)
+            if current_fk is None and any(name not in pose_by_ee for name in motion.tool_frames):
+                current_fk = self.fk_tool_poses(current)
+            goal, idle_joints = self._goal_for_ee_poses(current, pose_by_ee, current_fk=current_fk)
             goals.append(goal)
         if len(goals) == 1:
             result = motion.plan_pose(
@@ -824,17 +927,23 @@ class CuroboPlanner:
         group_joints = set(GROUP_JOINTS[group_name])
         motion = self._sync_locked_arm(group_name, current)
         active = self._active(current)
+        # 单臂求解器的活动关节不含被锁的另一臂。目标仍按双臂关节名组装，FK 要求名字完全一致。
+        goals = [self._active(goal) for goal in goals]
         hold_joints = [n for n in self.joint_names if n not in group_joints]
+        for index, goal in enumerate(goals):
+            collision_error = self._check_mesh_endpoint(goal, label=f"关节目标[{index + 1}/{len(goals)}]")
+            if collision_error:
+                return self._fail(collision_error)
         if len(goals) == 1:
             result = motion.plan_cspace(
-                motion.kinematics.get_active_js(goals[0].clone()),
+                goals[0],
                 active,
                 max_attempts=max_attempts,
                 finetune_attempts=self._finetune_attempts,
             )
         else:
             result = motion.plan_joint_waypoints(
-                [motion.kinematics.get_active_js(goal.clone()) for goal in goals],
+                list(goals),
                 active,
                 max_attempts=max_attempts,
                 finetune_attempts=self._finetune_attempts,

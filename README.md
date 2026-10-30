@@ -1,339 +1,157 @@
 # curobo_ros_python
 
-ROS 2 封装，用 cuRobo 做双臂运动规划。默认机器人 **Lycus**（`lycus.yml`），也支持 K100（`robot:=k100.yml`）。
+ROS 2 Humble 双臂规划节点，支持 Lycus（`lycus.yml`）和 K100（`k100.yml`）。OPT 通过 Service 规划整条轨迹，MPC 通过 Action 跟踪末端目标。两者在同一节点中互斥使用 GPU。
 
-同一节点提供两套算法，debug / deploy 只改可视化和是否下发控制器，不切换算法：
+## 环境安装与构建
 
-| | TrajOpt | MPC |
-|--|---------|-----|
-| 接口 | Service `plan_*` / `compute_ik` | Action `/follow_mpc` |
-| 做什么 | 一次规划整条轨迹 | 周期滚动优化，跟笛卡尔目标 |
-| 结果 | `/curobo/planned_trajectory` | `/curobo/mpc_plan` |
-| 执行 | `execute_trajectory:=true` 时 FollowJointTrajectory | 同一开关：debug 每拍下发，deploy 只发轨迹 |
-| GPU | 节点启动时加载并 warmup | 第一次 `follow_mpc` 才创建；空闲不 tick |
+推荐目录结构：
 
-节点和 cuRobo 跑在**同一个 Python 3.10**（cuRobo 的 uv 环境 `.venv` 里要同时有 `torch`；`rclpy` 来自 ROS 2 Humble）。
-
-和 `curobo`、`Lycus_ros` 同级：`/home/victor/wh/curobo_ros_python`。cuRobo 本体在 `../curobo/`（`import curobo`），机器人 YAML 在 `curobo/content/configs/robot/`。
-
-## 目录
-
-```
-curobo_ros_python/
-  msg/
-    curobo_ros_interfaces/        # srv / msg / action
-    perception_msgs/              # /obj_poses（Pose6DArray）
-  src/curobo_ros_python/
-    config/debug.yaml             # 仿真 / RViz：可视化 + 下发控制器
-    config/deploy.yaml            # 实机：只发 topic，不画、不跟控制器
-    launch/
-    scripts/
-      pub_left_waypoints.py       # 循环发左臂 MPC 路点
-      obj_pose_to_plan.py         # 一帧目标位姿 → plan_pose_goal
-      plot_mpc_joint_tracking.py  # 录命令 vs /joint_states
-    curobo_ros_python/
-      main.py                     # 节点入口
-      motion_planning_node.py     # ROS 接口
-      planning/
-        algorithms/trajopt.py     # CuroboPlanner
-        algorithms/mpc.py         # DualArmMpc
-        mpc_follow.py             # FollowMpc 周期
-        trajectory.py / groups.py / geom.py / pointcloud.py
-      visualization/
-        rviz.py                   # 拼 Marker / DisplayTrajectory
-        publish.py                # 按开关发到 RViz
+```text
+workspace/
+  curobo/                 # 已配置 CUDA/Torch 的 Python 3.10 .venv
+  curobo_ros_python/      # 本仓库
+  Lycus_ros/             # 机器人驱动、控制器和描述（按部署需要）
 ```
 
-## 依赖
+前提是 NVIDIA GPU、可工作的 CUDA/Torch、ROS 2 Humble，以及 `../curobo/.venv/bin/python` 能导入 cuRobo。安装脚本复用该环境，不负责安装驱动、Torch 或 cuRobo 本体。
 
-- ROS 2 Humble（`/opt/ros/humble`，apt）
-- cuRobo 仓库根目录的 `.venv`（与本仓库同级的 `../curobo/.venv`，Python 3.10，能 `import curobo` 和 `torch`）
-- NVIDIA GPU + CUDA
-- 机器人 bringup：`/joint_states`、臂控制器、TF
-
-zsh 下 source `setup.zsh`。节点 Python 查找顺序：launch 参数 `curobo_python` → 环境变量 `CUROBO_PYTHON` → 当前虚拟环境或 conda → 从本仓库和当前目录向上找到的 cuRobo `.venv`。不写死本机路径。
-
-## 编译
-
-在仓库根目录编译即可，colcon 会递归找到 `msg/` 和 `src/`：
+在本仓库根目录执行：
 
 ```bash
-cd /home/victor/wh/curobo_ros_python
-source /opt/ros/humble/setup.zsh
+# 首次安装：ROS 系统依赖、FCL Python 依赖、构建所有接口及节点包
+bash scripts/setup_environment.sh --system-deps
+
+# 已安装系统依赖：只补 Python 依赖并构建
+bash scripts/setup_environment.sh
+
+# 只检查，既不安装也不构建
+bash scripts/setup_environment.sh --check
+```
+
+`CUROBO_PYTHON=/absolute/path/bin/python` 可指定 Python；`ROS_SETUP=/opt/ros/humble/setup.bash` 可指定 ROS 环境。Python 依赖安装优先使用目标环境的 pip，没有 pip 时尝试 `uv pip --python`。二者都没有时脚本会给出错误，不自动更换 Python 或安装 Torch。
+
+OPT 必需依赖为 `python-fcl==0.7.0.11`、`trimesh>=4.0`，见 `requirements-fcl.txt`。脚本会检查 CUDA、ROS 导入、Lycus URDF/配置、FCL 独立忽略表及相机连杆名称。
+
+Jetson 若已配置 `libcusolver_batched_stub.so`，脚本与 launch 会使用现有兼容库；脚本不生成兼容库。遇到 Torch/cuSOLVER 导入错误，先修复 cuRobo 环境。
+
+手动构建：
+
+```bash
+source /opt/ros/humble/setup.bash
 colcon build --symlink-install
-source install/setup.zsh
+source install/setup.bash
 ```
 
-`colcon` 用 ROS 的 Python。规划节点会自己找到旁边 cuRobo 仓库的 `.venv`。也可以先激活它：
+zsh 交互终端使用 `setup.zsh`。构建使用 ROS 系统 Python；规划节点使用带 Torch/cuRobo 的 Python 3.10。修改源码或配置后重新构建并重启节点。
+
+## 启动与 TF
+
+机器人驱动先发布真实 `/joint_states`；执行轨迹还需要对应控制器。
 
 ```bash
-source ../curobo/.venv/bin/activate
-```
+source install/setup.bash
 
-链到已有工作空间：
-
-```bash
-ln -s /home/victor/wh/curobo_ros_python/msg/curobo_ros_interfaces ~/ros2_ws/src/
-ln -s /home/victor/wh/curobo_ros_python/msg/perception_msgs ~/ros2_ws/src/
-ln -s /home/victor/wh/curobo_ros_python/src/curobo_ros_python ~/ros2_ws/src/
-cd ~/ros2_ws && colcon build --packages-select curobo_ros_interfaces perception_msgs curobo_ros_python
-```
-
-## 启动
-
-先起机器人。参数在 `config/debug.yaml` / `config/deploy.yaml`。优先级：**命令行显式传入 > yaml > 节点默认值**。调试 launch 的覆盖项默认都是空，不传就不会盖 yaml。
-
-仿真 / 对着 RViz 调（可视化开，`execute_trajectory: true`，插值 `interpolation_dt: 0.1`）：
-
-```bash
+# 调试：可视化开启，默认允许控制器执行
 ros2 launch curobo_ros_python curobo_motion_planning.launch.py
-```
 
-实机（订 `/joint_states` 和点云，结果发 topic，不画 RViz、不跟控制器；插值 `interpolation_dt: 0.02`）：
+# 调试但不执行
+ros2 launch curobo_ros_python curobo_motion_planning.launch.py execute_trajectory:=false
 
-```bash
+# 部署：默认只发布规划结果，关闭可视化及控制器切换
 ros2 launch curobo_ros_python curobo_motion_planning_deploy.launch.py
 ```
 
-常用覆盖：
+实际参数以 `src/curobo_ros_python/config/debug.yaml`、`deploy.yaml` 为准。当前两者插值步长均为 `0.02 s`，TrajOpt 速度缩放为 `0.5`；MPC 周期为 `0.10 s`、速度缩放为 `1.0`，启动预热默认关闭。调试 launch 提供多个命令行规划参数覆盖，部署 launch 的覆盖项主要是 `config`、`robot`、Python 和 TF 参数。用 `--show-args` 查看对应入口支持项。
 
-```bash
-# K100
-ros2 launch curobo_ros_python curobo_motion_planning.launch.py robot:=k100.yml
+当前 Debug launch 只启动规划节点，需要外部机器人 TF。Deploy 默认增加 `robot_state_publisher`，使用 cuRobo robot YAML 对应 URDF，并订阅配置的 `joint_states_topic`；活动关节 TF 随反馈更新，固定关节发布到 `/tf_static`。已由 MoveIt/机器人 bringup 发布同一套 TF 时，部署 launch 加 `publish_robot_tf:=false`。
 
-# 只规划不执行（TrajOpt 和 MPC 都不下发控制器）
-ros2 launch curobo_ros_python curobo_motion_planning.launch.py execute_trajectory:=false
+Lycus 相机命名统一为：
 
-# 跳过 TrajOpt warmup（启动快，第一次规划慢）
-ros2 launch curobo_ros_python curobo_motion_planning.launch.py warmup_iterations:=0
-
-# 自动找到的解释器不对时，再显式指定
-ros2 launch curobo_ros_python curobo_motion_planning.launch.py \
-  curobo_python:=/path/to/curobo/.venv/bin/python
+```text
+base_link -> ... -> HeadRGBD_link -> camera_01_link -> camera_01_color_optical_frame
 ```
 
-`config:=deploy.yaml` 会按部署配置跑调试 launch。细节参数改 yaml；注释写在 yaml 里。
+cuRobo 模型须包含相机改名提交 `1ebff3b` 或后续版本。最后一段光学 TF 由相机驱动或标定外参提供。Deploy 可用 `publish_camera_tf:=true` 发布；同时传入实际的 `camera_parent_frame`、`camera_frame`、`camera_xyz`（m）、`camera_rpy`（rad）。该开关默认关闭，默认外参只是示例，启用前应核对标定。
 
-## 接口一览
+## OPT 定版流程
 
-节点名：`curobo_motion_planning_node`。`group_name`：`left_arm`、`right_arm`、`both_arms`。响应都有 `success`、`message`。
+1. 从当前反馈建立规划起点，原地更新夹爪/mimic、躯干和头部几何；这些反馈关节不参与手臂优化或下发。
+2. 点云通过 TF 转到 `base_link`，更新 GPU 环境及 CPU FCL mesh 环境；相同点云的 FCL 场景跨规划组缓存复用。
+3. 关节目标：提取规划组活动关节，每个路点先全身 FCL；碰撞则整次请求失败。单点走关节空间规划，多点先整体优化，失败再分段。
+4. 位姿目标：转到 `base_link`，IK 的成功候选逐个做全身 FCL，剔除碰撞候选，剩余候选才进入 TrajOpt。单点有重试及 PRM 种子路径，多点先整体路点优化，失败后分段衔接。
+5. 优化内部仍使用 GPU 球碰撞及 L-BFGS。完整双臂位姿请求不做多余当前 FK；单臂多路点复用当前 FK。
+6. 输出补回双臂关节顺序，未规划侧保持当前角度、导数为零，保留规划侧速度/加速度/jerk；实际输出终点再全身 FCL，通过后发布并按执行开关下发。
 
-| 接口 | 类型 | 作用 |
+`both_arms` 的每个位姿路点必须同时提供左右目标；仅给一侧会报错，单臂目标应使用 `left_arm` 或 `right_arm`。双臂关节路点为 14 个角度（左 7、右 7），单臂为 7 个；单位 rad。Lycus 关节前缀为 `AR5-5_08L/R-W4C1C5-ZY2_`。ROS 四元数顺序为 xyzw。
+
+### 碰撞配置与边界
+
+- GPU 球模型使用 cuRobo 的 `lycus.yml/self_collision_ignore`。
+- Lycus 全身 FCL 使用包内 `planning/lycus_fcl_collision.yaml/self_collision_ignore` 独立完整表。此表检查左右 link5/link7；GPU 暂时忽略这两对以避免粗球误报。代码没有五七特例，也没有独立腕部模块。
+- 其他机器人尚未提供独立 FCL 表，沿用各自机器人配置中的配对。
+- FCL 在 CPU 上检查 mesh 表面相交，覆盖 IK 候选、输入关节目标和实际输出终点；不覆盖整条轨迹，不是连续碰撞或封闭物体包含检测。中间路径及拼接检查仍使用球模型。
+- URDF 没有 collision 几何的连杆会在启动日志列出，不进行 mesh 检查。
+
+日志示例：
+
+```text
+OPT: IK 候选已启用全机器人 FCL 自碰撞和环境碰撞筛选
+FCL IK筛选: 检查=2, 通过=2, 剔除=0, FCL耗时=...ms; 环境=...
+FCL 输出终点: 通过, 自碰撞通过; 环境=..., 耗时=...ms
+FCL 关节目标[1/3]: 通过, ...
+```
+
+候选 FCL 耗时已包含在 IK 阶段计时中，不能重复相加；`check` 是底层规划器原有验收计时，不代表 FCL。`wall` 是 ROS 请求处理到规划完成的实际耗时，含状态同步、目标准备和输出整理，不含后续轨迹执行等待。
+
+## 接口与示例
+
+| 接口 | 类型 | 用途 |
 |---|---|---|
-| `/plan_joint_goal` | `PlanJointGoal` | 关节路点规划 |
-| `/plan_pose_goal` | `PlanPoseGoal` | 末端位姿路点规划 |
-| `/compute_ik` | `ComputeIK` | 只求 IK |
-| `/follow_mpc` | `FollowMpc` | 打开 MPC；取消即关 |
-
-`follow_mpc` 进行中会拒绝 `plan_*` / `compute_ik`；已有 Goal 时拒绝第二个 `follow_mpc`。TrajOpt 占着 GPU 时，新的 `follow_mpc` 也会被拒绝。
-
-订阅：`/joint_states`、点云（debug / deploy 默认 `/all_points`）、`/curobo/target`（`MpcTarget`）。
-
-发布：
-
-| 话题 | 何时发 | 内容 |
-|---|---|---|
-| `/curobo/planned_trajectory` | `plan_*` 成功 | `JointTrajectory` |
-| `/curobo/mpc_plan` | `follow_mpc` 每个周期 | `MpcPlan`（左右轨迹 + 误差） |
-| `/display_planned_path` | debug 可视化开 | `DisplayTrajectory`，整机关节动画 |
-| `/{robot}_motion_trajectory` | 同上 | `MarkerArray`：TrajOpt 绿线；MPC 左青 / 右品红预测末端 + 目标球 |
-| `/curobo/goal_waypoints` | `visualize_goal_waypoints` 开 | 笛卡尔 / 关节目标的球和 RGB 轴；规划失败也保留 |
-| `/curobo/collision_world` | 点云可视化开 | 橙色体素 |
-
-Lycus 末端线话题默认是 `/lycus_motion_trajectory`。`/curobo/goal_waypoints` 和 `/curobo/collision_world` 是 latched（`TRANSIENT_LOCAL`），后开的 RViz 也能看到上一帧。
-
-## TrajOpt
-
-一次规划整条轨迹。`execute_trajectory:=true` 时再 FollowJointTrajectory。debug 默认开，deploy 默认关。
-
-- **单臂**：只优化该臂 7 轴，另一臂钉在当前关节 / 当前 FK。
-- **`both_arms` 关节**：每个路点 14 个数，前 7 左、后 7 右。
-- **`both_arms` 位姿**：`waypoints`（默认左）和等长的 `other_waypoints`（默认右）一起规划。只填 `waypoints` 时另一臂钉在当前 FK。
-
-1 个路点就是点到点；多个路点按顺序飞过。同一下标是同一时刻的左右目标。四元数是 ROS `xyzw`。`PoseStamped.header.frame_id` 为空或等于 `base_frame` 时直接用，否则查 TF。
-
-关节单位 rad，顺序与 FollowJointTrajectory 控制器一致。`plan_joint_goal` 每个 `waypoints[i].positions` 长度必须等于规划组自由度（7 或 14）。
-
-**Lycus** 单臂：`AR5-5_08L/R-W4C1C9-ZY2_joint_1` … `_joint_7`。`both_arms` = 左 7 + 右 7。
-
-**K100** 单臂：`left_` / `right_` + `shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw`。
-
-执行：
-
-- `left_arm` → `/left_arm_controller/follow_joint_trajectory`
-- `right_arm` → `/right_arm_controller/follow_joint_trajectory`
-- `both_arms` → `/both_arms_controller/follow_joint_trajectory`
-
-左右臂控制器关节不重叠，可同时激活。`both_arms_controller` 占 14 轴，和单臂控制器互斥，执行前会 `switch_controller`。只用单臂时可 `switch_controllers:=false`。
-
-`trajopt_velocity_scale` 把下发轨迹的时间拉长（debug / deploy 默认 `1.0`）。`0.5` 大约半速。`interpolation_dt` 是规划轨迹的插值步长：debug `0.1` s，deploy `0.02` s。
-
-需要先有 `/joint_states`。规划可能要几秒到十几秒，客户端超时请设大。下面按 Lycus。位姿用仿真里 `tf2_echo base_link left_arm_ee_link` 记下的可达姿态；远路点只改 xyz，不要把四元数写成 `w: 1`。
+| `/plan_joint_goal` | `curobo_ros_interfaces/srv/PlanJointGoal` | 关节路点规划 |
+| `/plan_pose_goal` | `curobo_ros_interfaces/srv/PlanPoseGoal` | 位姿路点规划 |
+| `/compute_ik` | `curobo_ros_interfaces/srv/ComputeIK` | IK，成功候选也经 FCL |
+| `/follow_mpc` | `curobo_ros_interfaces/action/FollowMpc` | 周期跟踪；取消停止 |
 
 ```bash
-# 单臂关节
 ros2 service call /plan_joint_goal curobo_ros_interfaces/srv/PlanJointGoal \
   "{group_name: left_arm, waypoints: [{positions: [0, 0, 0, 0, 0, 0, 0]}]}"
-
-# 单臂多路点
-ros2 service call /plan_joint_goal curobo_ros_interfaces/srv/PlanJointGoal \
-  "{group_name: left_arm, waypoints: [
-     {positions: [0, 0, 0, 0, 0, 0, 0]},
-     {positions: [0.2, 0, 0, 0.5, 0, 0, 0]}]}"
-
-# 双臂关节（14 维）
-ros2 service call /plan_joint_goal curobo_ros_interfaces/srv/PlanJointGoal \
-  "{group_name: both_arms, waypoints: [
-     {positions: [0, 0, 0, 0, 0, 0, 0,  0, 0, 0, 0, 0, 0, 0]}]}"
-
-# 单臂位姿（当前左臂末端；frame_id 可改成能变到 base_link 的坐标系）
-ros2 service call /plan_pose_goal curobo_ros_interfaces/srv/PlanPoseGoal \
-  "{group_name: left_arm, ee_link: left_arm_ee_link,
-    waypoints: [
-      {header: {frame_id: base_link},
-       pose: {position: {x: 0.270, y: 0.755, z: 1.153},
-              orientation: {x: 0.884, y: 0.031, z: 0.401, w: -0.239}}}
-    ]}"
-
-# 双臂位姿（waypoints 左、other_waypoints 右，等长；右臂姿态请换成实测可达值）
-ros2 service call /plan_pose_goal curobo_ros_interfaces/srv/PlanPoseGoal \
-  "{group_name: both_arms,
-    waypoints: [
-      {header: {frame_id: base_link},
-       pose: {position: {x: 0.270, y: 0.755, z: 1.153},
-              orientation: {x: 0.884, y: 0.031, z: 0.401, w: -0.239}}}
-    ],
-    other_waypoints: [
-      {header: {frame_id: base_link},
-       pose: {position: {x: 0.270, y: -0.755, z: 1.153},
-              orientation: {x: 0.884, y: 0.031, z: 0.401, w: -0.239}}}
-    ]}"
-
-# IK
-ros2 service call /compute_ik curobo_ros_interfaces/srv/ComputeIK \
-  "{group_name: left_arm,
-    pose: {header: {frame_id: base_link},
-           pose: {position: {x: 0.270, y: 0.755, z: 1.153},
-                  orientation: {x: 0.884, y: 0.031, z: 0.401, w: -0.239}}}}"
 ```
 
-`visualize_goal_waypoints:=true`（debug 默认开）时，请求一到就往 `/curobo/goal_waypoints` 发目标和中间路点，规划失败也留着。左臂黄球、右臂品红球、中间路点白球，旁边是红 / 绿 / 蓝坐标轴。
+位姿请求使用 `waypoints`（PoseStamped 列表）、`ee_link`；双臂同时设置等长 `other_waypoints`、`other_ee_link`。末端名为 `left_arm_ee_link`、`right_arm_ee_link`。具体字段以 `msg/curobo_ros_interfaces/srv/` 为准。
 
-## MPC
+输出包括 `/curobo/planned_trajectory`、`/curobo/mpc_plan`，调试可视化包括 `/display_planned_path`、`/lycus_motion_trajectory`、`/curobo/goal_waypoints` 和 `/curobo/collision_world`。
 
-笛卡尔跟随。先发 `/curobo/target`，再开 `/follow_mpc`。每个周期：读关节 → 点云更新碰撞 → 写左右末端目标 → 滚动优化 → 发 `MpcPlan`。`execute_trajectory:=true` 时把这一拍的短轨迹异步下发给 `FollowJointTrajectory`（`start_delay=0`，下一拍顶替；取消 Goal 即停）。debug 默认会下发，deploy 默认只发 topic。
+控制器对应 `/left_arm_controller/follow_joint_trajectory`、`/right_arm_controller/follow_joint_trajectory`、`/both_arms_controller/follow_joint_trajectory`。`execute_trajectory` 决定是否执行，`switch_controllers` 决定是否切换控制器。
 
-- 第一次 Goal 才创建 `ModelPredictiveControl`；第一次 `step` 会冷启动（较慢），之后热启动。
-- MPC 只规划左右臂 14 个关节，腰/胸/头等关节在建模时就按当前值锁死。否则求解器会安排躯干配合，而躯干没有控制器跟随，手臂就会替它乱补。
-- `mpc_control_period` 是 ROS tick 周期。debug / deploy 都是 `0.10` s。
-- `mpc_optimization_dt` 是一条 `action_sequence` 盖住的时间，debug / deploy 都是 `0.14` s。内部 `interpolation_steps=4`，相邻命令点间隔是 `optimization_dt / 4`（`command_dt=0.035` s）。这两个参数不用写成同一个数。
-- 求解器的速度 / 加速度沿用上一拍最后一个命令点，避免每拍都从静止重新起步。
-- `mpc_velocity_scale` 拉长下发时间，跟手保持 `1.0`。小于 1 时每拍只走轨迹前半段。
-- 默认 `mpc_run_ik:=false`，纯笛卡尔跟踪。远路点直接下发即可，不必拆成近路点。开 IK 会额外加一个关节空间吸引点，和笛卡尔代价拉扯，末端常停在半路。
-- 某一侧 `has_*:=false`：该臂钉在当前末端，另一臂仍跟。`MpcTarget` 里缺省四元数是单位四元数，不能靠 `w: 1` 表示「没给姿态」。
-- `timeout<=0` 一直跟到取消；`position_tolerance` / `orientation_tolerance` `<=0` 不因到位自动成功。取消 Goal 即停。
-- 点云碰撞与 TrajOpt 相同，每个周期把当前点云打成一块 `cam` mesh 整表替换。
+## 点云与 MPC
 
-先跟当前左臂姿态，再把 xyz 换成远点（四元数保持可达姿态）：
+默认订阅 `/all_points`，按 `base_link <- camera_01_color_optical_frame` 变换；`pointcloud_child_frame` 为空时采用消息 `header.frame_id`。相机跟随头部运动，因此每次获取 TF。
+
+`require_pointcloud: false` 时缺少点云/TF 可能按空场景规划；FCL 日志会写明 `空场景（未检查环境障碍）`。需要强制环境保护时在 YAML 中设为 `true`。可用以下命令诊断：
 
 ```bash
-ros2 topic pub -r 10 /curobo/target curobo_ros_interfaces/msg/MpcTarget "{
-  has_left: true,
-  has_right: false,
-  left: {header: {frame_id: base_link}, pose: {
-    position: {x: 0.270, y: 0.755, z: 1.153},
-    orientation: {x: 0.884, y: 0.031, z: 0.401, w: -0.239}}}
-}"
-ros2 action send_goal /follow_mpc curobo_ros_interfaces/action/FollowMpc \
-  "{timeout: 0.0, position_tolerance: 0.0, orientation_tolerance: 0.0}" --feedback
+ros2 topic echo /all_points --once --field header
+ros2 run tf2_ros tf2_echo base_link camera_01_color_optical_frame
 ```
 
-循环发三个已记录的左臂路点（1 s、1 s、5 s，10 Hz）：
+MPC 仍使用原有 GPU 球碰撞，不接入本轮 OPT FCL。目标由 `/curobo/target`（`MpcTarget`）输入，启动 `/follow_mpc` 后滚动优化并发布 `MpcPlan`。当前命令序列覆盖约 0.5 s；`mpc_prewarm` 开启时缓存指定模式，没点云可空场景预热，有点云但 TF 缺失仍需等待。运行 MPC 时拒绝并发 OPT/IK 请求。
+
+辅助脚本位于 `src/curobo_ros_python/scripts/`，包括目标位姿规划、MPC 路点发布和关节跟踪记录；使用各脚本 `--help` 查看参数。
+
+## 回归验证
+
+加载 ROS 环境并使用规划 Python，在仓库根目录运行：
 
 ```bash
-python src/curobo_ros_python/scripts/pub_left_waypoints.py
+export PYTHONPATH="$PWD/src/curobo_ros_python:$PYTHONPATH"
+../curobo/.venv/bin/python -m unittest discover \
+  -s src/curobo_ros_python/test -p 'test_mesh_candidate_filter.py'
+../curobo/.venv/bin/python -m unittest discover \
+  -s src/curobo_ros_python/test -p 'test_opt_flow_cleanup.py'
 ```
 
-`MpcPlan` 含 `success`、`message`、`solve_time`，以及 `left` / `right`（`target_valid`、误差、`used_target`、短时域 `trajectory`）。
+Jetson 直接运行 Python 时，按现有环境设置 `LD_PRELOAD`；正常 launch 会通过 `launch_utils` 加载已有兼容库。测试不发运动命令。
 
-对照命令和 `/joint_states`（仿真里速度常为 0，脚本会改用位置差分；仿真的 actual 往往就是插值后的命令）：
+## 代码工作区约定
 
-```bash
-python src/curobo_ros_python/scripts/plot_mpc_joint_tracking.py --arm left --duration 15
-```
-
-图默认写到 `/tmp/mpc_joint_tracking.png`。
-
-## 感知目标 → 规划
-
-`scripts/obj_pose_to_plan.py` 等一帧 `/obj_poses`（`perception_msgs/Pose6DArray`），留下 `valid==1` 且 `label` 匹配的目标，变到 `base_link` 后取 **+Y 最大**（机器人左侧）的那个，加上偏移再调 `/plan_pose_goal`。默认 `label=5`（BOX），偏移 `(-0.4, 0, 0.10)` m。
-
-```bash
-python src/curobo_ros_python/scripts/obj_pose_to_plan.py --dry-run
-python src/curobo_ros_python/scripts/obj_pose_to_plan.py --label 5 --group left_arm
-```
-
-## RViz
-
-debug.yaml 默认打开。RViz Fixed Frame 用 `base_link` 或 `world`。
-
-1. **Add → MarkerArray**，话题 `/lycus_motion_trajectory`（或 `/{robot}_motion_trajectory`）
-   - TrajOpt：绿色末端路径
-   - MPC：左青 / 右品红预测末端，大球是本周期实际目标
-2. **Add → MarkerArray**，话题 `/curobo/goal_waypoints`：请求里的目标（失败也留）
-3. **Add → MarkerArray**，话题 `/curobo/collision_world`：点云体素
-4. MoveIt **MotionPlanning** 已听 `/display_planned_path` 时，会播整机关节预览
-
-| 话题 | 消息 | 看见什么 |
-|---|---|---|
-| `/display_planned_path` | `DisplayTrajectory` | 整台机器人按关节角演轨迹 |
-| `/lycus_motion_trajectory` | `MarkerArray` | 末端扫过的线 |
-| `/curobo/goal_waypoints` | `MarkerArray` | 目标球 + RGB 轴 |
-| `/curobo/collision_world` | `MarkerArray` | 规划用的点云障碍 |
-
-`visualize_trajectory:=false` 不发前两个；`visualize_goal_waypoints:=false` 不发目标球；`visualize_mesh_obstacles:=false` 仍做点云碰撞，只是不发体素。deploy 默认都关。`follow_mpc` 开始时会清掉 TrajOpt 预览，结束后清掉 MPC 那组 marker。
-
-## 点云碰撞
-
-取最近一帧点云，查 TF `pointcloud_parent_frame ← pointcloud_child_frame`（debug / deploy 默认 `base_link ← camera_01_color_optical_frame`），变到规划系后 `Mesh.from_pointcloud`。`pointcloud_child_frame` 为空时用消息的 `header.frame_id`。头会动，所以每次现查 TF。
-
-debug / deploy 的点云话题是 `/all_points`。节点在没读到 yaml 时的默认值仍是 `/camera/depth_registered/points` 和 `camera_depth_optical_frame`，正常 launch 不会走到那里。
-
-- `use_pointcloud:=false` 或 `pointcloud_topic` 为空：按空场景规划
-- `filter_pointcloud:=true` 才做距离滤波和体素下采样（默认关）
-- `require_pointcloud:=true`：没有点云 / TF 则失败；`false` 则告警后 TrajOpt 按空场景、MPC 沿用上一环境
-
-## 和 MoveIt 版的差异
-
-- 规划器是 cuRobo，不是 OMPL/PILZ。
-- 双臂在同一套模型里规划；下发给控制器的只有规划组那 7/14 维。
-- 单臂请求会钉住另一臂。
-- `plan_pose_goal` 在 `both_arms` + `other_waypoints` 时两臂笛卡尔目标同时优化。
-- 点云障碍从 TF 取当前头部位姿，不是写死外参。
-
-## 常见问题
-
-- **服务很久才返回**：正常。TrajOpt warmup 和第一次规划更慢；MPC 第一次 `follow_mpc` 的第一拍会冷启动。
-- **`尚未收到 /joint_states`**：先起机器人状态发布。
-- **Action 不可用 / 轨迹没执行**：控制器没起来，或 `execute_trajectory:=false`。deploy 默认就是 false，只发 `/curobo/mpc_plan` 和 `/curobo/planned_trajectory`。
-- **`import curobo` / `No module named torch`**：launch 没找到 cuRobo 的 `.venv`。激活该环境，或设置 `curobo_python` / `CUROBO_PYTHON`。
-- **zsh 里 source setup.bash 找不到 setup.sh**：改用 `setup.zsh`。
-- **IK / 规划失败**：看 `message`。会区分末端不可达、自碰、场景碰撞、关节限位。Lycus 末端不要用单位四元数当目标。
-- **点云没进规划**：要有 TF `camera_01_color_optical_frame → base_link`，以及 `/all_points` 有数据。
-- **RViz 没有线 / 没有体素 / 没有目标球**：确认 debug launch。TrajOpt 绿线要先成功规划一次；目标球在请求到达时就发，失败也留着；MPC 预览要先 `follow_mpc`。
-- **未知机器人配置**：`robot` 目前只认 `lycus.yml` / `k100.yml`。
-
-## Deploy 的机器人 TF
-
-Deploy 默认独立启动 `robot_state_publisher`，读取所选 cuRobo robot YAML 的同一份 URDF，订阅 deploy 配置中的真实 `joint_states_topic`，发布 `/tf` 和 `/tf_static`，无需 MoveIt。不会启动假关节状态或控制器。已有其他机器人 TF 发布者时，追加 `publish_robot_tf:=false`；`robot_urdf:=/absolute/path/robot.urdf` 可显式指定 TF 模型，应与规划器保持一致。
-
-若光学系未定义在 URDF，且没有相机驱动等节点发布该外参，可启用静态 TF：
-
-```bash
-ros2 launch curobo_ros_python curobo_motion_planning_deploy.launch.py \
-  publish_camera_tf:=true camera_parent_frame:=camera_01_link \
-  camera_frame:=camera_01_color_optical_frame \
-  camera_xyz:="0 0 0" camera_rpy:="-1.5707963267948966 0 -1.5707963267948966"
-```
-
-上面使用标准相机本体系（X 前、Y 左、Z 上）到光学系（X 右、Y 下、Z 前）的旋转，平移暂设零；实际安装有偏移或轴向不同时须填写标定结果。相机静态 TF 默认不发布，避免与相机驱动重复。点云可读取该 TF 树；规划器另通过关节反馈更新躯干/头部固定几何。
+后续默认直接在远程 `ai:/home/ai/wh/curobo_ros_python` 修改和验证，本机为同步副本。提交时必须同时包含主流程与新增 FCL/固定状态模块、策略 YAML 和测试，避免 Git 更新后仅留下无调用的孤立文件。构建产物、日志、虚拟环境和离线基准数据不属于核心源码上传范围。

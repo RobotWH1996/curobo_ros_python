@@ -1,0 +1,255 @@
+# OPT mesh self-collision exclusions, independent of GPU sphere exclusions.
+# Both link5/link7 pairs are intentionally checked. Edit this table to change FCL pairs.
+self_collision_ignore:
+  AR5-5_08L-W4C1C5-ZY2_base:
+  - Chest_link
+  - AR5-5_08L-W4C1C5-ZY2_link1
+  - AR5-5_08L-W4C1C5-ZY2_link2
+  - AR5-5_08L-W4C1C5-ZY2_link3
+  - Neck_link
+  - Waist_link
+  AR5-5_08L-W4C1C5-ZY2_flan_link:
+  - AR5-5_08L-W4C1C5-ZY2_link7
+  - left_arm_ee_link
+  - AR5-5_08L-W4C1C5-ZY2_link5
+  - AR5-5_08L-W4C1C5-ZY2_link6
+  - attached_object
+  - left_gripper_base
+  - left_gripper_right_jaw
+  - left_gripper_left_jaw
+  AR5-5_08L-W4C1C5-ZY2_link1:
+  - AR5-5_08L-W4C1C5-ZY2_base
+  - AR5-5_08L-W4C1C5-ZY2_link2
+  - AR5-5_08L-W4C1C5-ZY2_link3
+  - AR5-5_08L-W4C1C5-ZY2_link4
+  - Chest_link
+  AR5-5_08L-W4C1C5-ZY2_link2:
+  - AR5-5_08L-W4C1C5-ZY2_link1
+  - AR5-5_08L-W4C1C5-ZY2_link3
+  - AR5-5_08L-W4C1C5-ZY2_base
+  - AR5-5_08L-W4C1C5-ZY2_link4
+  - AR5-5_08L-W4C1C5-ZY2_link5
+  - Chest_link
+  AR5-5_08L-W4C1C5-ZY2_link3:
+  - AR5-5_08L-W4C1C5-ZY2_link2
+  - AR5-5_08L-W4C1C5-ZY2_link4
+  - AR5-5_08L-W4C1C5-ZY2_base
+  - AR5-5_08L-W4C1C5-ZY2_link1
+  - AR5-5_08L-W4C1C5-ZY2_link5
+  - AR5-5_08L-W4C1C5-ZY2_link6
+  AR5-5_08L-W4C1C5-ZY2_link4:
+  - AR5-5_08L-W4C1C5-ZY2_link3
+  - AR5-5_08L-W4C1C5-ZY2_link5
+  - AR5-5_08L-W4C1C5-ZY2_link1
+  - AR5-5_08L-W4C1C5-ZY2_link2
+  - AR5-5_08L-W4C1C5-ZY2_link6
+  - AR5-5_08L-W4C1C5-ZY2_link7
+  AR5-5_08L-W4C1C5-ZY2_link5:
+  - AR5-5_08L-W4C1C5-ZY2_link4
+  - AR5-5_08L-W4C1C5-ZY2_link6
+  - AR5-5_08L-W4C1C5-ZY2_link2
+  - AR5-5_08L-W4C1C5-ZY2_link3
+  - AR5-5_08L-W4C1C5-ZY2_flan_link
+  AR5-5_08L-W4C1C5-ZY2_link6:
+  - AR5-5_08L-W4C1C5-ZY2_link5
+  - AR5-5_08L-W4C1C5-ZY2_link7
+  - AR5-5_08L-W4C1C5-ZY2_link3
+  - AR5-5_08L-W4C1C5-ZY2_link4
+  - AR5-5_08L-W4C1C5-ZY2_flan_link
+  - attached_object
+  AR5-5_08L-W4C1C5-ZY2_link7:
+  - AR5-5_08L-W4C1C5-ZY2_link6
+  - AR5-5_08L-W4C1C5-ZY2_flan_link
+  - left_arm_ee_link
+  - AR5-5_08L-W4C1C5-ZY2_link4
+  - attached_object
+  - left_gripper_base
+  - left_gripper_right_jaw
+  - left_gripper_left_jaw
+  AR5-5_08R-W4C1C5-ZY2_base:
+  - Chest_link
+  - AR5-5_08R-W4C1C5-ZY2_link1
+  - AR5-5_08R-W4C1C5-ZY2_link2
+  - AR5-5_08R-W4C1C5-ZY2_link3
+  - Neck_link
+  - Waist_link
+  AR5-5_08R-W4C1C5-ZY2_flan_link:
+  - AR5-5_08R-W4C1C5-ZY2_link7
+  - right_arm_ee_link
+  - AR5-5_08R-W4C1C5-ZY2_link5
+  - AR5-5_08R-W4C1C5-ZY2_link6
+  - right_gripper_base
+  - right_gripper_right_jaw
+  - right_gripper_left_jaw
+  AR5-5_08R-W4C1C5-ZY2_link1:
+  - AR5-5_08R-W4C1C5-ZY2_base
+  - AR5-5_08R-W4C1C5-ZY2_link2
+  - AR5-5_08R-W4C1C5-ZY2_link3
+  - AR5-5_08R-W4C1C5-ZY2_link4
+  - Chest_link
+  AR5-5_08R-W4C1C5-ZY2_link2:
+  - AR5-5_08R-W4C1C5-ZY2_link1
+  - AR5-5_08R-W4C1C5-ZY2_link3
+  - AR5-5_08R-W4C1C5-ZY2_base
+  - AR5-5_08R-W4C1C5-ZY2_link4
+  - AR5-5_08R-W4C1C5-ZY2_link5
+  - Chest_link
+  AR5-5_08R-W4C1C5-ZY2_link3:
+  - AR5-5_08R-W4C1C5-ZY2_link2
+  - AR5-5_08R-W4C1C5-ZY2_link4
+  - AR5-5_08R-W4C1C5-ZY2_base
+  - AR5-5_08R-W4C1C5-ZY2_link1
+  - AR5-5_08R-W4C1C5-ZY2_link5
+  - AR5-5_08R-W4C1C5-ZY2_link6
+  AR5-5_08R-W4C1C5-ZY2_link4:
+  - AR5-5_08R-W4C1C5-ZY2_link3
+  - AR5-5_08R-W4C1C5-ZY2_link5
+  - AR5-5_08R-W4C1C5-ZY2_link1
+  - AR5-5_08R-W4C1C5-ZY2_link2
+  - AR5-5_08R-W4C1C5-ZY2_link6
+  - AR5-5_08R-W4C1C5-ZY2_link7
+  AR5-5_08R-W4C1C5-ZY2_link5:
+  - AR5-5_08R-W4C1C5-ZY2_link4
+  - AR5-5_08R-W4C1C5-ZY2_link6
+  - AR5-5_08R-W4C1C5-ZY2_link2
+  - AR5-5_08R-W4C1C5-ZY2_link3
+  - AR5-5_08R-W4C1C5-ZY2_flan_link
+  AR5-5_08R-W4C1C5-ZY2_link6:
+  - AR5-5_08R-W4C1C5-ZY2_link5
+  - AR5-5_08R-W4C1C5-ZY2_link7
+  - AR5-5_08R-W4C1C5-ZY2_link3
+  - AR5-5_08R-W4C1C5-ZY2_link4
+  - AR5-5_08R-W4C1C5-ZY2_flan_link
+  AR5-5_08R-W4C1C5-ZY2_link7:
+  - AR5-5_08R-W4C1C5-ZY2_link6
+  - AR5-5_08R-W4C1C5-ZY2_flan_link
+  - right_arm_ee_link
+  - AR5-5_08R-W4C1C5-ZY2_link4
+  - right_gripper_base
+  - right_gripper_right_jaw
+  - right_gripper_left_jaw
+  Calf_link:
+  - Chassis_link
+  - Thigh_link
+  - Waist_link
+  - Chest_link
+  - Neck_link
+  - Head_link
+  Chassis_link:
+  - base_link
+  - Wheel1_link
+  - Wheel2_link
+  - Wheel3_link
+  - Wheel4_link
+  - Calf_link
+  - Thigh_link
+  - Waist_link
+  - Chest_link
+  - Neck_link
+  - Head_link
+  Chest_link:
+  - Waist_link
+  - Neck_link
+  - AR5-5_08L-W4C1C5-ZY2_base
+  - AR5-5_08R-W4C1C5-ZY2_base
+  - AR5-5_08L-W4C1C5-ZY2_link1
+  - AR5-5_08L-W4C1C5-ZY2_link2
+  - AR5-5_08R-W4C1C5-ZY2_link1
+  - AR5-5_08R-W4C1C5-ZY2_link2
+  - Head_link
+  - Chassis_link
+  - Calf_link
+  - Thigh_link
+  Head_link:
+  - Neck_link
+  - camera_01_link
+  - Chassis_link
+  - Calf_link
+  - Thigh_link
+  - Waist_link
+  - Chest_link
+  Neck_link:
+  - Chest_link
+  - Head_link
+  - AR5-5_08L-W4C1C5-ZY2_base
+  - AR5-5_08R-W4C1C5-ZY2_base
+  - Chassis_link
+  - Calf_link
+  - Thigh_link
+  - Waist_link
+  Thigh_link:
+  - Calf_link
+  - Waist_link
+  - Chassis_link
+  - Chest_link
+  - Neck_link
+  - Head_link
+  Waist_link:
+  - Thigh_link
+  - Chest_link
+  - Neck_link
+  - Chassis_link
+  - Calf_link
+  - Head_link
+  - AR5-5_08L-W4C1C5-ZY2_base
+  - AR5-5_08R-W4C1C5-ZY2_base
+  left_gripper_base:
+  - AR5-5_08L-W4C1C5-ZY2_flan_link
+  - AR5-5_08L-W4C1C5-ZY2_link7
+  - left_gripper_right_jaw
+  - left_gripper_left_jaw
+  - left_arm_ee_link
+  - attached_object
+  left_gripper_right_jaw:
+  - left_gripper_base
+  - left_gripper_left_jaw
+  - left_arm_ee_link
+  - AR5-5_08L-W4C1C5-ZY2_flan_link
+  - AR5-5_08L-W4C1C5-ZY2_link7
+  - attached_object
+  left_gripper_left_jaw:
+  - left_gripper_base
+  - left_gripper_right_jaw
+  - left_arm_ee_link
+  - AR5-5_08L-W4C1C5-ZY2_flan_link
+  - AR5-5_08L-W4C1C5-ZY2_link7
+  - attached_object
+  right_gripper_base:
+  - AR5-5_08R-W4C1C5-ZY2_flan_link
+  - AR5-5_08R-W4C1C5-ZY2_link7
+  - right_gripper_right_jaw
+  - right_gripper_left_jaw
+  - right_arm_ee_link
+  right_gripper_right_jaw:
+  - right_gripper_base
+  - right_gripper_left_jaw
+  - right_arm_ee_link
+  - AR5-5_08R-W4C1C5-ZY2_flan_link
+  - AR5-5_08R-W4C1C5-ZY2_link7
+  right_gripper_left_jaw:
+  - right_gripper_base
+  - right_gripper_right_jaw
+  - right_arm_ee_link
+  - AR5-5_08R-W4C1C5-ZY2_flan_link
+  - AR5-5_08R-W4C1C5-ZY2_link7
+  left_arm_ee_link:
+  - AR5-5_08L-W4C1C5-ZY2_flan_link
+  - AR5-5_08L-W4C1C5-ZY2_link7
+  - attached_object
+  - left_gripper_base
+  - left_gripper_right_jaw
+  - left_gripper_left_jaw
+  right_arm_ee_link:
+  - AR5-5_08R-W4C1C5-ZY2_flan_link
+  - AR5-5_08R-W4C1C5-ZY2_link7
+  - right_gripper_base
+  - right_gripper_right_jaw
+  - right_gripper_left_jaw
+  attached_object:
+  - left_arm_ee_link
+  - AR5-5_08L-W4C1C5-ZY2_link6
+  - AR5-5_08L-W4C1C5-ZY2_link7
+  - AR5-5_08L-W4C1C5-ZY2_flan_link
+  - left_gripper_base
+  - left_gripper_right_jaw
+  - left_gripper_left_jaw

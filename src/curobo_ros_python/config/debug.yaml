@@ -50,7 +50,7 @@ curobo_motion_planning_node:
     pointcloud_child_frame: camera_01_color_optical_frame  # 点云所在光学系；空则用消息 header.frame_id
 
     # --- MPC（/follow_mpc 期间生效）---
-    mpc_prewarm: true                   # 启动时各模式预热一次，不等点云；之后不再重建
+    mpc_prewarm: false                   # 启动时各模式预热一次，不等点云；之后不再重建
     mpc_prewarm_modes: [left_arm, right_arm, both_arms] # 缓存三种模式；增加显存和启动准备时间
     mpc_device: cuda:0                  # MPC 设备
     mpc_optimization_dt: 0.14           # knot 步长。命令点间隔 0.035 s

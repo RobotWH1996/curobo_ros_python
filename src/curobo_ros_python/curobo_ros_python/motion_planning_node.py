@@ -1085,6 +1085,8 @@ class CuroboMotionPlanningNode(Node):
 
     def _build_pose_waypoints(self, request, other, other_ee):
         """返回 (规划路点, 可视化位姿, 错误)。可视化位姿在变到 base 之后；校验失败则用原始位姿。"""
+        if request.group_name == "both_arms" and not other:
+            return None, self._raw_goal_items(request), "both_arms 必须同时提供左右臂目标；单臂目标请使用 left_arm 或 right_arm"
         if other:
             if request.group_name != "both_arms":
                 return None, self._raw_goal_items(request), "other_waypoints 只用于 group_name=both_arms"
