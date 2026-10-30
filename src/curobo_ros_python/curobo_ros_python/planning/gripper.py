@@ -85,25 +85,20 @@ class GripperStateUpdater:
         return cls(join_path(str(get_assets_path()), path))
 
     def update(self, values: Mapping[str, float], models: Sequence[Any]) -> bool:
-        """使用米制关节位置更新所有 FK/碰撞副本；缺失反馈时拒绝使用默认开合。"""
+        """使用实测关节位置更新所有 FK/碰撞副本；缺失反馈时拒绝使用默认开合。"""
         if not self.joint_names:
             return False
         missing = [name for name in self.joint_names if name not in values]
         if missing:
-            raise ValueError(f"缺少夹爪状态 {missing}，请在 /joint_states 发布实测开合位置（米）")
+            raise ValueError(f"缺少实测关节状态 {missing}，请在 /joint_states 发布反馈")
         positions = {}
         for name, (lower, upper) in self._limits.items():
             q = float(values[name])
             if not math.isfinite(q) or q < lower - 1e-6 or q > upper + 1e-6:
-                raise ValueError(f"夹爪 {name}={q} 超出 URDF 限位 [{lower}, {upper}] m")
+                raise ValueError(f"实测关节 {name}={q} 超出 URDF 限位 [{lower}, {upper}]")
             positions[name] = min(upper, max(lower, q))
         changed = positions != self._previous
-        matrices = torch.stack([
-            finger.origin.clone() for finger in self._fingers
-        ])
-        for i, finger in enumerate(self._fingers):
-            q = positions[finger.source] * finger.multiplier + finger.offset
-            matrices[i, :, 3] += finger.direction * q
+        matrices = self._matrices(positions)
         if not models:
             raise RuntimeError("没有可更新的夹爪运动学模型")
         seen = set()
@@ -112,14 +107,14 @@ class GripperStateUpdater:
             transforms = kin.fixed_transforms
             key = id(transforms)
             if any(name in model.joint_names for name in self.joint_names):
-                raise RuntimeError("夹爪仍在优化关节中，请在机器人配置 lock_joints 中锁定夹爪")
+                raise RuntimeError("实测固定关节仍在优化变量中，请检查机器人 lock_joints")
             if key not in seen:
                 seen.add(key)
                 binding = self._bindings.get(key)
                 if binding is None:
                     rows = [kin.link_name_to_idx_map[f.child] for f in self._fingers]
                     if any(int(kin.joint_map_type[row]) != -1 for row in rows):
-                        raise RuntimeError("夹爪或 mimic 手指未锁定，拒绝修改活动关节变换")
+                        raise RuntimeError("实测固定关节或 mimic 未锁定，拒绝修改活动关节变换")
                     indices = torch.tensor(rows, dtype=torch.long, device=transforms.device)
                     # 持有原张量引用，避免对象释放后 id 被重用。
                     binding = (transforms, indices)
@@ -142,3 +137,49 @@ class GripperStateUpdater:
                             tensor[..., column] = 0.0
         self._previous = positions
         return changed
+
+
+    def _matrices(self, positions):
+        matrices = torch.stack([finger.origin.clone() for finger in self._fingers])
+        for i, finger in enumerate(self._fingers):
+            q = positions[finger.source] * finger.multiplier + finger.offset
+            matrices[i, :, 3] += finger.direction * q
+        return matrices
+
+
+class MeasuredPostureUpdater(GripperStateUpdater):
+    """Keep measured torso/head geometry fixed during arm-only optimization."""
+    NAMES = ('Calf_joint', 'Thigh_joint', 'Waist_joint', 'Chest_joint', 'Neck_joint', 'Head_joint')
+
+    def __init__(self, urdf_path: str):
+        joints = {j.get('name'): j for j in ET.parse(urdf_path).getroot().findall('joint')}
+        self.joint_names = tuple(name for name in self.NAMES if name in joints)
+        self._limits, self._fingers, self._bindings = {}, [], {}
+        self._previous = None
+        for name in self.joint_names:
+            joint = joints[name]
+            if joint.get('type') != 'revolute':
+                raise ValueError(f'实测躯干/头部关节类型不支持：{name}')
+            limit = joint.find('limit')
+            self._limits[name] = (float(limit.get('lower')), float(limit.get('upper')))
+            origin = joint.find('origin')
+            matrix = torch.zeros((3,4), dtype=torch.float32)
+            matrix[:,:3] = _rotation(_vector(origin, 'rpy', '0 0 0'))
+            matrix[:,3] = torch.tensor(_vector(origin, 'xyz', '0 0 0'))
+            axis = torch.tensor(_vector(joint.find('axis'), 'xyz', '1 0 0'))
+            if float(torch.linalg.vector_norm(axis)) < 1e-8:
+                raise ValueError(f'无效关节轴：{name}')
+            axis = axis/torch.linalg.vector_norm(axis)
+            self._fingers.append(_Finger(name, joint.find('child').get('link'), matrix, axis, 1., 0.))
+
+    def _matrices(self, positions):
+        matrices = torch.stack([finger.origin.clone() for finger in self._fingers])
+        for i, finger in enumerate(self._fingers):
+            x,y,z = finger.direction.tolist()
+            angle = positions[finger.source]
+            c,s = math.cos(angle),math.sin(angle)
+            skew = torch.tensor([[0.,-z,y],[z,0.,-x],[-y,x,0.]])
+            axis = finger.direction
+            rotation = c*torch.eye(3)+(1-c)*torch.outer(axis,axis)+s*skew
+            matrices[i,:,:3] = finger.origin[:,:3] @ rotation
+        return matrices

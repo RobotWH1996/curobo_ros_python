@@ -109,3 +109,24 @@ def _usable_curobo_python(path: str) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return True
+
+
+def robot_urdf_path(python_exe: str, robot: str, explicit: str = "") -> str:
+    """Resolve the planner model using its Python environment, without loading CUDA."""
+    if explicit.strip():
+        path = os.path.abspath(os.path.expanduser(explicit.strip()))
+    else:
+        script = (
+            "import os,sys\n"
+            "from curobo.config_io import load_yaml\n"
+            "from curobo.content import get_robot_configs_path, get_assets_path\n"
+            "cfg=load_yaml(os.path.join(str(get_robot_configs_path()), sys.argv[1]))\n"
+            "print(os.path.join(str(get_assets_path()), cfg['robot_cfg']['kinematics']['urdf_path']))\n"
+        )
+        result = subprocess.run([python_exe, "-c", script, robot], check=True,
+                                capture_output=True, text=True, timeout=30,
+                                env=dict(os.environ, **conda_lib_env(python_exe)))
+        path = result.stdout.strip()
+    if not os.path.isfile(path):
+        raise RuntimeError(f"找不到 robot_state_publisher 使用的 URDF：{path}")
+    return path

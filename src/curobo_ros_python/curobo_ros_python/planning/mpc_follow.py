@@ -138,10 +138,6 @@ class MpcFollower:
         needed.update(node.planner.gripper_joint_names)
         if not needed or not needed.issubset(node._joint_map):
             return False
-        if node.use_pointcloud and node.pointcloud_topic:
-            with node._pc_lock:
-                if node._pc_msg is None:
-                    return False
         locks = {
             "left_arm": GROUP_JOINTS["right_arm"],
             "right_arm": GROUP_JOINTS["left_arm"],
@@ -155,10 +151,15 @@ class MpcFollower:
             started = time.monotonic()
             mpc = self.ensure(locks[mode])
             mpc.update_gripper_state(dict(node._joint_map))
-            error = self._sync_world(mpc, publish=False)
-            if error:
-                node.get_logger().warn(f"MPC 预热等待点云：{error}", throttle_duration_sec=5.0)
-                return False
+            with node._pc_lock:
+                has_cloud = node._pc_msg is not None
+            if not node.use_pointcloud or not node.pointcloud_topic or has_cloud:
+                error = self._sync_world(mpc, publish=False)
+                if error:
+                    node.get_logger().warn(f"MPC 预热等待点云：{error}", throttle_duration_sec=5.0)
+                    return False
+            else:
+                node.get_logger().info(f"MPC {mode} 预热时还没有点云，按空场景预热")
             current, missing = joint_map_to_curobo(
                 mpc.joint_names, dict(node._joint_map), mpc.device_cfg.device,
                 default_position=mpc.default_joint_position, joint_vel=dict(self._joint_vel),

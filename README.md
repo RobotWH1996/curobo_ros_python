@@ -295,7 +295,7 @@ debug.yaml 默认打开。RViz Fixed Frame 用 `base_link` 或 `world`。
 
 ## 点云碰撞
 
-取最近一帧点云，查 TF `pointcloud_parent_frame ← pointcloud_child_frame`（debug / deploy 默认 `base_link ← camera_color_optical_frame`），变到规划系后 `Mesh.from_pointcloud`。`pointcloud_child_frame` 为空时用消息的 `header.frame_id`。头会动，所以每次现查 TF。
+取最近一帧点云，查 TF `pointcloud_parent_frame ← pointcloud_child_frame`（debug / deploy 默认 `base_link ← camera_01_color_optical_frame`），变到规划系后 `Mesh.from_pointcloud`。`pointcloud_child_frame` 为空时用消息的 `header.frame_id`。头会动，所以每次现查 TF。
 
 debug / deploy 的点云话题是 `/all_points`。节点在没读到 yaml 时的默认值仍是 `/camera/depth_registered/points` 和 `camera_depth_optical_frame`，正常 launch 不会走到那里。
 
@@ -319,6 +319,21 @@ debug / deploy 的点云话题是 `/all_points`。节点在没读到 yaml 时的
 - **`import curobo` / `No module named torch`**：launch 没找到 cuRobo 的 `.venv`。激活该环境，或设置 `curobo_python` / `CUROBO_PYTHON`。
 - **zsh 里 source setup.bash 找不到 setup.sh**：改用 `setup.zsh`。
 - **IK / 规划失败**：看 `message`。会区分末端不可达、自碰、场景碰撞、关节限位。Lycus 末端不要用单位四元数当目标。
-- **点云没进规划**：要有 TF `camera_color_optical_frame → base_link`，以及 `/all_points` 有数据。
+- **点云没进规划**：要有 TF `camera_01_color_optical_frame → base_link`，以及 `/all_points` 有数据。
 - **RViz 没有线 / 没有体素 / 没有目标球**：确认 debug launch。TrajOpt 绿线要先成功规划一次；目标球在请求到达时就发，失败也留着；MPC 预览要先 `follow_mpc`。
 - **未知机器人配置**：`robot` 目前只认 `lycus.yml` / `k100.yml`。
+
+## Deploy 的机器人 TF
+
+Deploy 默认独立启动 `robot_state_publisher`，读取所选 cuRobo robot YAML 的同一份 URDF，订阅 deploy 配置中的真实 `joint_states_topic`，发布 `/tf` 和 `/tf_static`，无需 MoveIt。不会启动假关节状态或控制器。已有其他机器人 TF 发布者时，追加 `publish_robot_tf:=false`；`robot_urdf:=/absolute/path/robot.urdf` 可显式指定 TF 模型，应与规划器保持一致。
+
+若光学系未定义在 URDF，且没有相机驱动等节点发布该外参，可启用静态 TF：
+
+```bash
+ros2 launch curobo_ros_python curobo_motion_planning_deploy.launch.py \
+  publish_camera_tf:=true camera_parent_frame:=camera_01_link \
+  camera_frame:=camera_01_color_optical_frame \
+  camera_xyz:="0 0 0" camera_rpy:="-1.5707963267948966 0 -1.5707963267948966"
+```
+
+上面使用标准相机本体系（X 前、Y 左、Z 上）到光学系（X 右、Y 下、Z 前）的旋转，平移暂设零；实际安装有偏移或轴向不同时须填写标定结果。相机静态 TF 默认不发布，避免与相机驱动重复。点云可读取该 TF 树；规划器另通过关节反馈更新躯干/头部固定几何。

@@ -30,7 +30,7 @@ from curobo_ros_python.planning.groups import (
     resolve_ee_link,
     unknown_group,
 )
-from curobo_ros_python.planning.gripper import GripperStateUpdater
+from curobo_ros_python.planning.gripper import GripperStateUpdater, MeasuredPostureUpdater
 
 
 @dataclass
@@ -334,6 +334,7 @@ class CuroboPlanner:
         )
         urdf_joints = _urdf_joint_table(self._urdf_path(robot))
         self._gripper_state = GripperStateUpdater(self._urdf_path(robot))
+        self._measured_posture = MeasuredPostureUpdater(self._urdf_path(robot))
         self._planners: Dict[str, MotionPlanner] = {}
         self._locked: Dict[str, List[_LockedJoint]] = {}
         self._models: Dict[str, List[Any]] = {}
@@ -414,11 +415,11 @@ class CuroboPlanner:
         return self._gripper_state.joint_names
 
     def update_gripper_state(self, joint_map: Dict[str, float]) -> None:
-        """每次规划/IK 前更新实测夹爪；不改变活动关节和 CUDA Graph。"""
-        if not self.gripper_joint_names:
-            return
+        """每次规划/IK 前更新实测躯干、头部和夹爪；仅手臂参与优化，不改变 CUDA Graph。"""
         models = [model for motion in self._planners.values() for model in _robot_models(motion)]
-        if self._gripper_state.update(joint_map, models):
+        posture_changed = self._measured_posture.update(joint_map, models)
+        gripper_changed = self._gripper_state.update(joint_map, models)
+        if posture_changed or gripper_changed:
             for motion in self._planners.values():
                 if motion.graph_planner is not None:
                     motion.graph_planner.reset_buffer()
@@ -826,14 +827,14 @@ class CuroboPlanner:
         hold_joints = [n for n in self.joint_names if n not in group_joints]
         if len(goals) == 1:
             result = motion.plan_cspace(
-                goals[0],
+                motion.kinematics.get_active_js(goals[0].clone()),
                 active,
                 max_attempts=max_attempts,
                 finetune_attempts=self._finetune_attempts,
             )
         else:
             result = motion.plan_joint_waypoints(
-                list(goals),
+                [motion.kinematics.get_active_js(goal.clone()) for goal in goals],
                 active,
                 max_attempts=max_attempts,
                 finetune_attempts=self._finetune_attempts,

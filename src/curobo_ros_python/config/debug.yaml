@@ -6,7 +6,7 @@ curobo_motion_planning_node:
     scene_model: ""                     # 静态场景 YAML；空则无 cuboid/mesh 障碍（点云仍可单独开）
     warmup_iterations: 3                # TrajOpt CUDA graph warmup 次数；0 则启动快、第一次规划慢
     use_cuda_graph: true                # 是否捕获 CUDA graph；关则调试方便、稳态更慢
-    interpolation_dt: 0.1               # 规划轨迹插值步长 (s)补:规划轨迹稠密就减小，规划轨迹稀疏就加大，等时间插补
+    interpolation_dt: 0.02               # 规划轨迹插值步长 (s)补:规划轨迹稠密就减小，规划轨迹稀疏就加大，等时间插补
     trajopt_num_seeds: 2                # 并行种子。关节目标各种子相同，1 最快；位姿目标失败多了再调回 4
     trajopt_finetune_attempts: 0        # 首解后再压时间的轮数。0 只求可行（最快），3 是 cuRobo 原默认（4 轮 L-BFGS）
     trajopt_num_iters: 50               # 每轮 L-BFGS 步数，必须是 25 的倍数。障碍里失败再调回 100
@@ -47,10 +47,10 @@ curobo_motion_planning_node:
     pointcloud_exclude_boxes: " "  # 仿真 bag 里固定夹爪，xmin,ymin,zmin,xmax,ymax,zmax，base_link
     require_pointcloud: false           # true：没有点云/TF 则规划失败；false：告警后按空场景
     pointcloud_parent_frame: base_link  # 点云变到此系再进规划（应与 base_frame 一致）
-    pointcloud_child_frame: camera_color_optical_frame  # 点云所在光学系；空则用消息 header.frame_id
+    pointcloud_child_frame: camera_01_color_optical_frame  # 点云所在光学系；空则用消息 header.frame_id
 
     # --- MPC（/follow_mpc 期间生效）---
-    mpc_prewarm: true                   # 启动时把列出的模式各预热一次，之后不再重建
+    mpc_prewarm: true                   # 启动时各模式预热一次，不等点云；之后不再重建
     mpc_prewarm_modes: [left_arm, right_arm, both_arms] # 缓存三种模式；增加显存和启动准备时间
     mpc_device: cuda:0                  # MPC 设备
     mpc_optimization_dt: 0.14           # knot 步长。命令点间隔 0.035 s

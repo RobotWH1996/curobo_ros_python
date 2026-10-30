@@ -334,7 +334,7 @@ class CuroboMotionPlanningNode(Node):
             self._mpc_prewarm_timer = self.create_timer(
                 1.0, self._prewarm_mpc, callback_group=self._service_group
             )
-            self.get_logger().info(f"MPC 将在收到关节状态和点云后提前预热：{modes}")
+            self.get_logger().info(f"MPC 将在收到关节状态后提前预热，点云可后到：{modes}")
             self.get_logger().info("基础节点已启动，等待 MPC 预热完成...")
         else:
             self._log_initialization_complete()

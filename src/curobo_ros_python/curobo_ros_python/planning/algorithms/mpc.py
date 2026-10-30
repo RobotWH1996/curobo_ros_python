@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from curobo._src.geom.collision.collision_scene import SceneCollisionCfg
+from curobo.kinematics import Kinematics
 from curobo.model_predictive_control import ModelPredictiveControl, ModelPredictiveControlCfg
 from curobo.scene import Mesh, Scene
 from curobo.types import DeviceCfg, GoalToolPose, JointState, Pose
@@ -26,7 +27,7 @@ from curobo_ros_python.planning.algorithms.common import (
     squeeze_pose,
 )
 from curobo_ros_python.planning.groups import both_arm_ee_links
-from curobo_ros_python.planning.gripper import GripperStateUpdater
+from curobo_ros_python.planning.gripper import GripperStateUpdater, MeasuredPostureUpdater
 
 # 左臂 7 关节再右臂 7 关节，与 lycus cspace 顺序一致。躯干不在表里，仍用默认 0。
 # 肘在上，肩离限位留余量，腕关节放在 0，避免 joint_5 顶到 ±3.107。
@@ -69,8 +70,7 @@ _POSTURE_TABLES = {
 
 def _rotvec_wxyz(q_from: torch.Tensor, q_to: torch.Tensor) -> torch.Tensor:
     """q_from 转到 q_to 的旋转向量，四元数 wxyz。"""
-    if torch.dot(q_from, q_to) < 0:
-        q_to = -q_to
+    q_to = torch.where(torch.dot(q_from, q_to) < 0, -q_to, q_to)
     w1, x1, y1, z1 = q_to.unbind(-1)
     w2, x2, y2, z2 = q_from[0], -q_from[1], -q_from[2], -q_from[3]
     err = torch.stack(
@@ -83,10 +83,34 @@ def _rotvec_wxyz(q_from: torch.Tensor, q_to: torch.Tensor) -> torch.Tensor:
     )
     xyz = err[1:]
     norm = torch.linalg.norm(xyz)
-    if float(norm) < 1e-8:
-        return 2.0 * xyz
     angle = 2.0 * torch.atan2(norm, err[0].clamp(-1.0, 1.0))
-    return xyz * (angle / norm)
+    scale = torch.where(norm < 1e-8, torch.full_like(norm, 2.0), angle / norm.clamp_min(1e-8))
+    return xyz * scale
+
+
+def _stack_link_jacobians(
+    tool_jac: Optional[torch.Tensor],
+    frames: Sequence[str],
+    links: Sequence[str],
+) -> Optional[torch.Tensor]:
+    """按 links 顺序把 [num_links, 6, dof] 叠成 [6 * len(links), dof]。
+
+    每个末端先 3 行线速度、再 3 行角速度，列是主动关节。这和原先对基座标系
+    位置、空间旋转向量做差分的排列一致。
+    """
+    if tool_jac is None or not links:
+        return None
+    if tool_jac.ndim != 3 or tool_jac.shape[0] != len(frames) or tool_jac.shape[1] != 6:
+        return None
+    index = {name: i for i, name in enumerate(frames)}
+    try:
+        blocks = [tool_jac[index[name]] for name in links]
+    except KeyError:
+        return None
+    jac = torch.cat(blocks, dim=0)
+    if not bool(torch.isfinite(jac).all()):
+        return None
+    return jac
 
 
 def _multiple_of(value: int, step: int) -> int:
@@ -139,6 +163,13 @@ class DualArmMpc:
             raise ValueError(
                 f"mpc_num_control_points 必须是大于 5 的整数，收到 {num_control_points}"
             )
+        self._posture_targets = {}
+        self._posture_cost_cache = None
+        self._posture_limits = {}
+        self._posture_log_at = float("-inf")
+        self._posture_kin = None
+        self._posture_q = None
+        self._posture_js = None
         self._warn_at: Dict[str, float] = {}
         self.set_posture(posture)
         self.device_cfg = DeviceCfg(device=torch.device(device), dtype=torch.float32)
@@ -176,6 +207,7 @@ class DualArmMpc:
             )
         self.mpc = ModelPredictiveControl(cfg)
         self._gripper_state = GripperStateUpdater.from_robot(robot)
+        self._measured_posture = MeasuredPostureUpdater.from_robot(robot)
         # 默认只下发 4 个点、0.105 s。点云那拍会到 0.3 s，指令先跑完，控制器停住再起步就是抖。
         # 多下发已经规划好的插值点，盖住 0.50 s。knot 步长和加速度惩罚不动。
         mgr = self.mpc.trajectory_execution_manager
@@ -191,6 +223,10 @@ class DualArmMpc:
             raise ValueError(
                 f"MPC tool_frames={self.mpc.tool_frames} 缺少 {missing}，无法双臂跟踪"
             )
+        # 优化器 CUDA Graph 录下的是 rollout 里 compute_jacobian=False 的那次 kernel，
+        # 以及当时的输出缓冲地址。构型另建一份，固定 1×1 并打开解析雅可比，不去换那些缓冲。
+        # 配置张量仍与 auxiliary 共用，夹爪和锁关节的原地更新不用再复制一份几何。
+        self._posture_kinematics()
         self._setup_done = False
         self.prewarmed = False
         self._last_goal_key = None
@@ -208,7 +244,8 @@ class DualArmMpc:
             f"warm_iters={self.warm_start_iters} cold_iters={self.cold_start_iters} "
             f"nonterminal_pose={cfg.non_terminal_tool_pose_weight_factor:g}，"
             f"control_points={self.num_control_points}，"
-            f"规划关节 {len(self.joint_names)} 个"
+            f"规划关节 {len(self.joint_names)} 个，"
+            f"构型雅可比=独立解析实例"
         )
         if self.locked_joints:
             self._info(
@@ -217,10 +254,11 @@ class DualArmMpc:
             )
 
     def update_gripper_state(self, joint_map: Dict[str, float]) -> None:
-        """每拍读取夹爪反馈并原地更新几何，不重建 MPC 或重新预热。"""
-        if not self._gripper_state.joint_names:
-            return
+        """每拍按实测躯干、头部和夹爪原地更新几何；不重建 MPC 或重新预热。"""
         models = [self.mpc.kinematics]
+        posture_kin = getattr(self, "_posture_kin", None)
+        if posture_kin is not None:
+            models.append(posture_kin)
         # run_ik 模式使用独立 IK 求解器，也必须看到当前夹爪几何。
         for core in (self.mpc.core, self.mpc.ik_solver.core):
             rollouts = list(core.get_all_rollout_instances(
@@ -228,8 +266,9 @@ class DualArmMpc:
             ))
             rollouts.extend((getattr(core, "additional_metrics_rollouts", None) or {}).values())
             models.extend(rollout.transition_model.robot_model for rollout in rollouts)
+        self._measured_posture.update(joint_map, models)
         self._gripper_state.update(joint_map, models)
-        for name in self._gripper_state.joint_names:
+        for name in (*self._measured_posture.joint_names, *self._gripper_state.joint_names):
             self.locked_joints[name] = float(joint_map[name])
 
     def _info(self, msg: str):
@@ -361,13 +400,8 @@ class DualArmMpc:
             del old
 
     def fk_tool_poses(self, joint_state: JointState) -> Dict[str, Pose]:
-        kin = self.mpc.compute_kinematics(joint_state.clone())
-        if kin.tool_poses is None:
-            return {}
-        return {
-            name: squeeze_pose(kin.tool_poses.get_link_pose(name))
-            for name in self.mpc.tool_frames
-        }
+        poses, _tool_jac = self._tool_state(joint_state)
+        return poses
 
     def pose_error(self, current: Pose, target: Pose) -> Tuple[float, float]:
         return pose_error(current, target)
@@ -376,6 +410,8 @@ class DualArmMpc:
         if self._setup_done:
             return
         self.mpc.setup(current_state)
+        self._posture_cost_cache = None
+        self._posture_limits.clear()
         self._setup_done = True
         self._info("MPC setup 完成（首次较慢）")
 
@@ -426,6 +462,7 @@ class DualArmMpc:
         current_state: JointState,
         left_pose: Optional[Pose],
         right_pose: Optional[Pose],
+        tool_jac: Optional[torch.Tensor] = None,
     ) -> None:
         """沿末端雅可比的零空间，把关节往 L 构型收。
 
@@ -459,7 +496,7 @@ class DualArmMpc:
             links.append(self.right_ee)
         if not links:
             links = [self.left_ee, self.right_ee]
-        q_ref, dof_w = self._nullspace_toward(current_state, q, default, links)
+        q_ref, dof_w = self._nullspace_toward(q, default, links, tool_jac)
         if q_ref is None:
             self._warn_throttled("no_null", "当前构型没有末端零空间，本拍不附加构型代价")
             return
@@ -467,11 +504,11 @@ class DualArmMpc:
         if lower is not None:
             q_ref = torch.max(torch.min(q_ref, upper), lower)
         dq = (q_ref - q).detach().reshape(-1)
-        if not torch.isfinite(dq).all() or float(torch.linalg.norm(dq)) > self._POSTURE_STEP + 1e-3:
+        valid_step = torch.isfinite(dq).all() & (torch.linalg.norm(dq) <= self._POSTURE_STEP + 1e-3)
+        if not bool(valid_step):
             self._warn_throttled("posture_step", "构型步长异常，本拍不附加构型代价")
             return
-        goal_js.position = goal_js.position.clone()
-        goal_js.position[...] = q_ref
+        goal_js.position.copy_(q_ref.expand_as(goal_js.position))
         self.mpc.update_goal_state(goal_js)
         self._write_posture_weight(weight)
         if not self._write_dof_weight(dof_w):
@@ -479,7 +516,10 @@ class DualArmMpc:
         # 配置里非末端只有 0.05，下发的是时域开头几个点，构型代价等于没加在正在执行的轨迹上。
         self._write_nonterminal_factor(1.0)
         self.mpc.enable_joint_position_tracking()
-        self._info(self._posture_line(dq, weight))
+        now = time.monotonic()
+        if now - self._posture_log_at >= 2.0:
+            self._posture_log_at = now
+            self._info(self._posture_line(dq, weight))
 
     _POSTURE_STEP = 1.0
 
@@ -500,25 +540,27 @@ class DualArmMpc:
 
     def _l_posture(self, q: torch.Tensor) -> torch.Tensor:
         """按关节名写入当前构型。不在表里的关节保持默认位置。"""
-        table = _POSTURE_TABLES[self.posture_name]
-        target = self.default_joint_position.reshape(-1).to(device=q.device, dtype=q.dtype).clone()
-        if target.numel() != q.numel():
-            target = torch.zeros_like(q)
-        names = self.joint_names
-        for i, name in enumerate(names):
-            if i >= target.numel():
-                break
-            if name in table:
-                target[i] = table[name]
+        key = (self.posture_name, tuple(self.joint_names), q.device, q.dtype, q.numel())
+        target = self._posture_targets.get(key)
+        if target is None:
+            table = _POSTURE_TABLES[self.posture_name]
+            defaults = self.default_joint_position.detach().reshape(-1).cpu().tolist()
+            if len(defaults) != q.numel():
+                defaults = [0.0] * q.numel()
+            values = [table.get(name, defaults[i]) for i, name in enumerate(key[1][:q.numel()])]
+            values.extend(defaults[len(values):])
+            target = torch.tensor(values, device=q.device, dtype=q.dtype)
+            self._posture_targets[key] = target
         return target
 
     def _posture_line(self, dq: torch.Tensor, weight: float) -> str:
         names = self.joint_names
         parts = []
-        for i, value in enumerate(dq.tolist()):
+        values = dq.tolist()
+        for i, value in enumerate(values):
             name = names[i] if i < len(names) else f"j{i}"
             parts.append(f"{name}={value:+.4f}")
-        norm = float(torch.linalg.norm(dq))
+        norm = sum(value * value for value in values) ** 0.5
         return (
             f"构型本拍零空间收了 ||Δq||={norm:.4f} rad"
             f"（{self.posture_name}，权重 {weight:g}，上限 {self._POSTURE_STEP:.2f}） "
@@ -527,13 +569,15 @@ class DualArmMpc:
 
     def _nullspace_toward(
         self,
-        state: JointState,
         q: torch.Tensor,
         q_des: torch.Tensor,
         links: Sequence[str],
+        tool_jac: Optional[torch.Tensor],
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        jac = self._ee_jacobian(state, q, links)
-        if jac is None:
+        jac = _stack_link_jacobians(
+            tool_jac, self._posture_kinematics().tool_frames, links
+        )
+        if jac is None or jac.shape[-1] != q.numel():
             return None, None
         # 奇异值相对最大者太小的右奇异向量当成零空间。
         _u, singular, vh = torch.linalg.svd(jac, full_matrices=True)
@@ -545,107 +589,116 @@ class DualArmMpc:
         null = vh[rank:]
         dq_null = null.transpose(0, 1) @ (null @ (q_des - q))
         norm = torch.linalg.norm(dq_null)
-        if float(norm) > self._POSTURE_STEP:
-            dq_null = dq_null * (self._POSTURE_STEP / norm)
+        dq_null = dq_null * (self._POSTURE_STEP / norm.clamp_min(self._POSTURE_STEP))
         basis = null.abs().sum(dim=0)
         peak = basis.max().clamp(min=1e-6)
         return q + dq_null, basis / peak
 
-    def _ee_jacobian(
-        self, state: JointState, q: torch.Tensor, links: Sequence[str]
-    ) -> Optional[torch.Tensor]:
-        base = self._link_pose_rows(state, links)
-        if base is None:
-            return None
-        dof = q.numel()
-        eps = 1e-4
-        jac = torch.zeros(
-            (base.shape[0] * 6, dof), device=q.device, dtype=q.dtype
-        )
-        for i in range(dof):
-            q2 = q.clone()
-            q2[i] = q2[i] + eps
-            nxt = state.clone()
-            nxt.position = q2.reshape(state.position.shape)
-            pert = self._link_pose_rows(nxt, links)
-            if pert is None:
-                return None
-            for k in range(base.shape[0]):
-                jac[6 * k : 6 * k + 3, i] = (pert[k, :3] - base[k, :3]) / eps
-                jac[6 * k + 3 : 6 * k + 6, i] = (
-                    _rotvec_wxyz(base[k, 3:], pert[k, 3:]) / eps
-                )
-        return jac
+    def _posture_kinematics(self) -> Kinematics:
+        """构型用的运动学。输出缓冲固定 1×1，不调用求解器那份 Kinematics。"""
+        if self._posture_kin is None:
+            kin = Kinematics(
+                self.mpc.kinematics.config,
+                compute_jacobian=True,
+                compute_spheres=False,
+            )
+            q = torch.empty(
+                (1, kin.dof),
+                device=self.device_cfg.device,
+                dtype=self.device_cfg.dtype,
+            )
+            self._posture_q = q
+            self._posture_js = JointState.from_position(q, joint_names=list(kin.joint_names))
+            self._posture_kin = kin
+        return self._posture_kin
 
-    def _link_pose_rows(
-        self, state: JointState, links: Sequence[str]
-    ) -> Optional[torch.Tensor]:
-        poses = self.fk_tool_poses(state)
-        rows = []
-        for name in links:
-            pose = poses.get(name)
-            if pose is None or pose.position is None or pose.quaternion is None:
-                return None
-            pos = pose.position.detach().reshape(-1)[:3]
-            quat = pose.quaternion.detach().reshape(-1)[:4]
-            rows.append(torch.cat((pos, quat)))
-        return torch.stack(rows)
+    def _load_posture_state(self, joint_state: JointState) -> JointState:
+        kin = self._posture_kinematics()
+        src = joint_state
+        if src.joint_names is not None and list(src.joint_names) != list(kin.joint_names):
+            src = kin.get_active_js(src)
+        q = src.position.detach().reshape(-1, kin.dof)[:1]
+        self._posture_q.copy_(q)
+        return self._posture_js
+
+    def _tool_state(
+        self, joint_state: JointState
+    ) -> Tuple[Dict[str, Pose], Optional[torch.Tensor]]:
+        """一次正运动学：当前各工具位姿，以及 [num_links, 6, dof] 解析雅可比。"""
+        kin = self._posture_kinematics()
+        state = kin.compute_kinematics(self._load_posture_state(joint_state))
+        poses: Dict[str, Pose] = {}
+        if state.tool_poses is not None:
+            for name in kin.tool_frames:
+                pose = squeeze_pose(state.tool_poses.get_link_pose(name))
+                poses[name] = Pose(
+                    position=pose.position.detach().clone(),
+                    quaternion=pose.quaternion.detach().clone(),
+                    normalize_rotation=False,
+                )
+        tool_jac = None
+        if state.tool_jacobians is not None and state.tool_jacobians.ndim == 5:
+            # 缓冲下一拍会被覆写，这里拿走 [num_links, 6, dof] 的副本。
+            tool_jac = state.tool_jacobians.detach()[0, 0].clone()
+        return poses, tool_jac
+
+    def _posture_costs(self):
+        """求解器创建/预热后缓存代价引用；不替换 CUDA Graph 持有的张量。"""
+        if self._posture_cost_cache is None:
+            costs = []
+            seen = set()
+            for rollout in self.mpc.core.get_all_rollout_instances(include_optimizer_rollouts=True):
+                for cost in rollout.get_cost_component_by_name("cspace"):
+                    if cost is not None and id(cost) not in seen:
+                        seen.add(id(cost))
+                        costs.append(cost)
+            self._posture_cost_cache = tuple(costs)
+        return self._posture_cost_cache
 
     def _joint_position_limits(self, device, dtype):
-        for rollout in self.mpc.core.get_all_rollout_instances(include_optimizer_rollouts=True):
-            for cost in rollout.get_cost_component_by_name("cspace"):
-                if cost is None or cost.config.joint_limits is None:
+        key = (device, dtype)
+        if key not in self._posture_limits:
+            limits = (None, None)
+            for cost in self._posture_costs():
+                if cost.config.joint_limits is None:
                     continue
                 pos = cost.config.joint_limits.position
                 if pos.shape[0] == 2:
-                    return pos[0].to(device=device, dtype=dtype), pos[1].to(
-                        device=device, dtype=dtype
-                    )
-        return None, None
+                    limits = (pos[0].to(device=device, dtype=dtype), pos[1].to(device=device, dtype=dtype))
+                    break
+            self._posture_limits[key] = limits
+        return self._posture_limits[key]
 
     def _write_dof_weight(self, dof_w: torch.Tensor) -> bool:
         wrote = False
-        for rollout in self.mpc.core.get_all_rollout_instances(include_optimizer_rollouts=True):
-            for cost in rollout.get_cost_component_by_name("cspace"):
-                if cost is None:
-                    continue
-                current = cost.config.cspace_target_dof_weight
-                src = dof_w.reshape(-1).to(device=current.device, dtype=current.dtype)
-                if current.shape != src.shape:
-                    continue
-                current.copy_(src)
-                wrote = True
+        seen = set()
+        for cost in self._posture_costs():
+            current = cost.config.cspace_target_dof_weight
+            if id(current) in seen or current.shape != dof_w.shape:
+                continue
+            seen.add(id(current))
+            current.copy_(dof_w)
+            wrote = True
         if not wrote:
             self._warn_throttled("dof_weight", "构型自由度权重写不进去，本拍不附加构型代价")
         return wrote
 
+    def _write_posture_scalar(self, field: str, value: float) -> None:
+        seen = set()
+        for cost in self._posture_costs():
+            current = getattr(cost.config, field)
+            if current is None:
+                current = torch.tensor([value], device=self.device_cfg.device, dtype=self.device_cfg.dtype)
+                setattr(cost.config, field, current)
+            elif id(current) not in seen:
+                current.fill_(value)
+            seen.add(id(current))
+
     def _write_nonterminal_factor(self, factor: float) -> None:
-        value = torch.tensor(
-            [float(factor)], device=self.device_cfg.device, dtype=self.device_cfg.dtype
-        )
-        for rollout in self.mpc.core.get_all_rollout_instances(include_optimizer_rollouts=True):
-            for cost in rollout.get_cost_component_by_name("cspace"):
-                if cost is None:
-                    continue
-                current = cost.config.cspace_non_terminal_weight_factor
-                if current is None or current.shape != value.shape or current.device != value.device:
-                    cost.config.cspace_non_terminal_weight_factor = value.clone()
-                else:
-                    current.copy_(value)
+        self._write_posture_scalar("cspace_non_terminal_weight_factor", float(factor))
 
     def _write_posture_weight(self, weight: float) -> None:
-        value = torch.tensor(
-            [float(weight)], device=self.device_cfg.device, dtype=self.device_cfg.dtype
-        )
-        for rollout in self.mpc.core.get_all_rollout_instances(include_optimizer_rollouts=True):
-            for cost in rollout.get_cost_component_by_name("cspace"):
-                if cost is None:
-                    continue
-                current = cost.config.cspace_target_weight
-                if current.shape != value.shape or current.device != value.device:
-                    cost.config.cspace_target_weight = value.clone()
-                else:
-                    current.copy_(value)
+        self._write_posture_scalar("cspace_target_weight", float(weight))
 
     def step(self, current_state: JointState):
         self._ensure_setup(current_state)
@@ -658,9 +711,9 @@ class DualArmMpc:
         right_pose: Optional[Pose],
     ) -> MpcStep:
         self._ensure_setup(current_state)
-        current_ee = self.fk_tool_poses(current_state)
+        current_ee, tool_jac = self._tool_state(current_state)
         used = self.update_goals(current_state, left_pose, right_pose, fk=current_ee)
-        self._apply_posture_goal(current_state, left_pose, right_pose)
+        self._apply_posture_goal(current_state, left_pose, right_pose, tool_jac)
         result = self.step(current_state)
         self.remember_command(result)
 
