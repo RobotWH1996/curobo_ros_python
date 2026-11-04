@@ -229,9 +229,10 @@ def _robot_models(planner: MotionPlanner) -> List[Any]:
         found.append(robot)
 
     def add_rollout(rollout) -> None:
-        transition = getattr(rollout, "transition_model", None)
-        if transition is not None:
-            add(getattr(transition, "robot_model", None))
+        for name in ("transition_model", "metrics_transition_model"):
+            transition = getattr(rollout, name, None)
+            if transition is not None:
+                add(getattr(transition, "robot_model", None))
 
     add(planner.kinematics)
     for solver in (planner.ik_solver, planner.trajopt_solver):
@@ -245,6 +246,10 @@ def _robot_models(planner: MotionPlanner) -> List[Any]:
         extra = getattr(core, "additional_metrics_rollouts", None) or {}
         for rollout in extra.values():
             add_rollout(rollout)
+        seed = getattr(solver, "seed_ik_solver", None)
+        if seed is not None:
+            add(seed.kinematics)
+            add(seed._robot_model)
     graph = planner.graph_planner
     if graph is not None:
         add_rollout(getattr(graph, "feasibility_rollout", None))
@@ -297,6 +302,7 @@ class CuroboPlanner:
         trajopt_num_iters: int = 50,
         finetune_attempts: int = 1,
         logger=None,
+        self_filter_geometry: bool = False,
     ):
         self._log = logger
         seeds = int(num_trajopt_seeds)
@@ -323,6 +329,8 @@ class CuroboPlanner:
             cache = {"mesh": 1}
         if cache and "mesh" not in cache and not getattr(scene_model, "voxel", None):
             cache.setdefault("mesh", 1)
+        cache = dict(cache or {})
+        cache.setdefault("cuboid", 32)
         self._cache = cache
         self._scene_model = scene_model or None
         self._use_cuda_graph = use_cuda_graph
@@ -381,7 +389,7 @@ class CuroboPlanner:
             if idle:
                 self._locked_pose[group_name] = {name: 0.0 for name in idle}
         self.planner = self._planners["both_arms"]
-        self._mesh_checker = MeshCollisionChecker.from_robot(robot)
+        self._mesh_checker = MeshCollisionChecker.from_robot(robot, retain_meshes=self_filter_geometry)
         self._mesh_positions = {}
         self._mesh_feedback = {}
         self._mesh_scenes = {}
@@ -410,19 +418,22 @@ class CuroboPlanner:
         return f"mesh障碍={count}" if count else "空场景（未检查环境障碍）"
 
     def _report_mesh_candidates(self, checked: int, rejected: Sequence[MeshCollision]) -> None:
+        if getattr(self._mesh_checker, "skip_fcl_checks", False):
+            self._fcl_candidate_ms = 0.0
+            self.last_fcl_candidates = {}
+            return
         elapsed_ms = getattr(self, '_fcl_candidate_ms', 0.0)
         self._fcl_candidate_ms = 0.0
         self.last_fcl_candidates = {"checked": checked, "rejected": len(rejected), "elapsed_ms": elapsed_ms}
         self._info(f"FCL IK筛选: 检查={checked}, 通过={checked - len(rejected)}, "
                    f"剔除={len(rejected)}, FCL耗时={elapsed_ms:.2f}ms; "
                    f"环境={self._fcl_environment_label()}" +
-                   ("; 无成功IK候选可检查" if checked == 0 else ""))
-        if rejected:
-            hit = rejected[0]
-            self._info(f"FCL IK 筛选: {checked} 个候选中剔除 {len(rejected)} 个; "
-                       f"首个碰撞={hit.kind}: {hit.first} / {hit.second}")
+                   ("; 无成功IK候选可检查" if checked == 0 else "") +
+                   (f"; 首个碰撞={rejected[0].kind}: {rejected[0].first} / {rejected[0].second}" if rejected else ""))
 
     def _check_mesh_endpoint(self, state: JointState, label: str = "输出终点") -> Optional[str]:
+        if getattr(self._mesh_checker, "skip_fcl_checks", False):
+            return None
         started = time.perf_counter()
         row = state.position.reshape(-1, state.position.shape[-1])[-1].detach().cpu().tolist()
         previous_ms = getattr(self, '_fcl_candidate_ms', 0.0)
@@ -462,6 +473,8 @@ class CuroboPlanner:
             {name: _LOCK_SENTINEL for name in idle},
             idle,
         )
+        from curobo_ros_python.planning.payload import configure_payload_links
+        robot = configure_payload_links(robot)
         cfg = MotionPlannerCfg.create(
             robot=robot,
             scene_model=self._scene_model,
@@ -535,6 +548,19 @@ class CuroboPlanner:
         for motion in self._planners.values():
             motion.destroy()
 
+    def clear_pointcloud_world(self, group_name: Optional[str] = None) -> None:
+        """Clear a valid cloud filtered to zero; don't reuse old body obstacles."""
+        from curobo._src.geom.types import SceneCfg
+        if self._scene_model is not None:
+            raise ValueError('本体过滤后为空且配置了静态场景，拒绝清空混合环境')
+        targets = [group_name] if group_name in self._planners else list(self._planners)
+        for group in targets:
+            scene = SceneCfg(cuboid=list(getattr(self, "_placed_objects", {}).values()))
+            self._planners[group].update_world(scene)
+            self._mesh_scenes[group] = self._mesh_checker.prepare_scene(scene)
+            self._cloud_loaded.pop(group, None)
+        self._info('本体过滤后环境点为零，GPU/FCL旧点云场景已清空')
+
     def update_world_from_points(
         self,
         points,
@@ -568,7 +594,7 @@ class CuroboPlanner:
         if self._cloud_fcl_sig != (sig, mesh_name):
             fcl_mesh = Mesh(name=mesh_name, pose=[0., 0., 0., 1., 0., 0., 0.],
                             vertices=self._cloud_vertices, faces=self._cloud_faces)
-            fcl_scene = self._mesh_checker.prepare_scene(SceneCfg(mesh=[fcl_mesh]))
+            fcl_scene = self._mesh_checker.prepare_scene(SceneCfg(mesh=[fcl_mesh], cuboid=list(getattr(self, "_placed_objects", {}).values())))
             self._cloud_fcl_scene = fcl_scene
             self._cloud_fcl_sig = (sig, mesh_name)
         fcl_scene = self._cloud_fcl_scene
@@ -583,7 +609,7 @@ class CuroboPlanner:
             checker = motion.scene_collision_checker
             old = pop_cached_mesh(checker, mesh.name)
             try:
-                motion.update_world(SceneCfg(mesh=[mesh]))
+                motion.update_world(SceneCfg(mesh=[mesh], cuboid=list(getattr(self, "_placed_objects", {}).values())))
             except Exception:
                 restore_cached_mesh(checker, mesh.name, old)
                 raise
@@ -710,6 +736,17 @@ class CuroboPlanner:
             name: squeeze_pose(kin.tool_poses.get_link_pose(name))
             for name in self.tool_frames
         }
+
+    def fk_tool_path(self, joint_state: JointState, tool: str):
+        """Batch FK as CPU xyz/wxyz rows, using one device-to-host transfer."""
+        motion = self._motion or self.planner
+        active = motion.kinematics.get_active_js(joint_state)
+        path = JointState.from_position(
+            active.position.reshape(1, -1, len(active.joint_names)),
+            joint_names=active.joint_names,
+        )
+        pose = motion.compute_kinematics(path).tool_poses.get_link_pose(tool)
+        return torch.cat((pose.position.reshape(-1, 3), pose.quaternion.reshape(-1, 4)), dim=-1).detach().cpu().numpy()
 
     def _goal_for_ee_poses(
         self,

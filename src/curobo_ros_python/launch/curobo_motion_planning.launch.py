@@ -87,12 +87,15 @@ def _launch_setup(context, *args, **kwargs):
             prefix=python_exe,
             additional_env=conda_lib_env(python_exe),
             parameters=params,
+            arguments=['--ros-args', '--log-level', f"curobo_motion_planning_node:={LaunchConfiguration('log_level').perform(context)}"],
         )
     ]
 
 
 def generate_launch_description():
     args = [
+        DeclareLaunchArgument('log_level', default_value='info', choices=['debug','info','warn','error','fatal'],
+                              description='规划节点日志级别；debug 包含关节、位姿明细'),
         DeclareLaunchArgument(
             "config",
             default_value="debug.yaml",

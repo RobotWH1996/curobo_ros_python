@@ -35,7 +35,7 @@ class MeshCollisionChecker:
     Instances are used under the planner's existing serialized request handling.
     """
 
-    def __init__(self, urdf_path: str, config: Mapping[str, Any]):
+    def __init__(self, urdf_path: str, config: Mapping[str, Any], retain_meshes: bool = False):
         import fcl
         self.fcl = fcl
         path = Path(urdf_path)
@@ -57,7 +57,8 @@ class MeshCollisionChecker:
                 known.add(joint.find('child').get('link'))
                 pending.remove(joint)
         self.origins = {j.get('name'): _origin(j.find('origin')) for j in self.ordered}
-        self.names, self.objects, corners = [], [], []
+        self.names, self.objects, self.meshes, corners = [], [], [], []
+        self.mesh_models = []
         self.skipped_links = []
         for name in config['collision_link_names']:
             link = root.find(f"link[@name='{name}']")
@@ -91,7 +92,14 @@ class MeshCollisionChecker:
                 raise ValueError(f'Collision link disconnected from {self.base_link}: {name}')
             mesh = trimesh.util.concatenate(parts)
             self.names.append(name)
-            self.objects.append(self._object(mesh))
+            if retain_meshes:
+                self.meshes.append(mesh)
+            if retain_meshes:
+                model = self._model(mesh)
+                self.mesh_models.append(model)
+                self.objects.append(self.fcl.CollisionObject(model))
+            else:
+                self.objects.append(self._object(mesh))
             corners.append(np.array(list(itertools.product(*zip(*mesh.bounds)))))
         if not self.names:
             raise ValueError('No robot collision geometry')
@@ -109,9 +117,23 @@ class MeshCollisionChecker:
         self.pairs = np.array([(i, j) for i, j in itertools.combinations(range(len(self.names)), 2)
                                if frozenset((self.names[i], self.names[j])) not in ignored], dtype=int).reshape(-1, 2)
         self.environment: dict[str, tuple[Any, np.ndarray]] = {}
+        self.environment_ignore_links = set()
+        self.payload = None
+
+    @staticmethod
+    def _lycus_fcl_policy_path() -> Path:
+        """FCL 忽略表放在包的 config/，与 GPU 球体表分开。"""
+        source = Path(__file__).resolve().parents[2] / 'config' / 'lycus_fcl_collision.yaml'
+        if source.is_file():
+            return source
+        from ament_index_python.packages import get_package_share_directory
+        installed = Path(get_package_share_directory('curobo_ros_python')) / 'config' / 'lycus_fcl_collision.yaml'
+        if installed.is_file():
+            return installed
+        raise FileNotFoundError(f'找不到 Lycus FCL 自碰撞表: {installed}')
 
     @classmethod
-    def from_robot(cls, robot: str) -> MeshCollisionChecker:
+    def from_robot(cls, robot: str, retain_meshes: bool = False) -> MeshCollisionChecker:
         from curobo.config_io import join_path, load_yaml
         from curobo.content import get_assets_path, get_robot_configs_path
         config = load_yaml(join_path(str(get_robot_configs_path()), robot))['robot_cfg']['kinematics']
@@ -119,7 +141,7 @@ class MeshCollisionChecker:
         # robots retain their existing policy until a dedicated table is supplied.
         if Path(robot).stem == 'lycus':
             import yaml
-            policy_path = Path(__file__).with_name('lycus_fcl_collision.yaml')
+            policy_path = cls._lycus_fcl_policy_path()
             policy = yaml.safe_load(policy_path.read_text())
             ignored = policy['self_collision_ignore']
             if not isinstance(ignored, dict) or any(
@@ -127,16 +149,20 @@ class MeshCollisionChecker:
             ):
                 raise ValueError(f'Invalid FCL exclusion policy: {policy_path}')
             config = dict(config, self_collision_ignore=ignored)
-        return cls(join_path(str(get_assets_path()), config['urdf_path']), config)
+        return cls(join_path(str(get_assets_path()), config['urdf_path']), config, retain_meshes=retain_meshes)
 
     def _object(self, mesh: trimesh.Trimesh) -> Any:
+        return self.fcl.CollisionObject(self._model(mesh))
+
+    def _model(self, mesh: trimesh.Trimesh) -> Any:
         if not len(mesh.faces) or not np.isfinite(mesh.vertices).all():
             raise ValueError('Invalid collision mesh')
         model = self.fcl.BVHModel()
-        model.beginModel(len(mesh.vertices), len(mesh.faces))
-        model.addSubModel(np.asarray(mesh.vertices), np.asarray(mesh.faces))
+        faces = np.asarray(mesh.faces, dtype=np.int32).reshape(-1, 3)
+        model.beginModel(len(mesh.vertices), len(faces))
+        model.addSubModel(np.asarray(mesh.vertices), faces)
         model.endModel()
-        return self.fcl.CollisionObject(model)
+        return model
 
     def prepare_scene(self, scene: Any) -> dict[str, tuple[Any, np.ndarray]]:
         """Build a replacement scene before mutating either collision backend."""
@@ -152,7 +178,7 @@ class MeshCollisionChecker:
             objects[obstacle.name] = (self._object(mesh), np.asarray(mesh.bounds))
         return objects
 
-    def _transforms(self, positions: Mapping[str, float]) -> np.ndarray:
+    def _transforms(self, positions: Mapping[str, float], link_names=None) -> np.ndarray:
         values = dict(self.defaults)
         values.update(positions)
         transforms = {self.base_link: np.eye(4)}
@@ -174,7 +200,22 @@ class MeshCollisionChecker:
                 raise ValueError(f'Non-finite joint state: {name}')
             return q
 
-        for joint in self.ordered:
+        ordered = self.ordered
+        if link_names is not None:
+            by_child = {j.find('child').get('link'): j for j in self.joints.values()}
+            ordered = []
+            seen = set()
+            for link in link_names:
+                path = []
+                while link != self.base_link:
+                    joint = by_child[link]
+                    path.append(joint)
+                    link = joint.find('parent').get('link')
+                for joint in reversed(path):
+                    if joint.get('name') not in seen:
+                        seen.add(joint.get('name'))
+                        ordered.append(joint)
+        for joint in ordered:
             name = joint.get('name')
             typ = joint.get('type')
             q = value(name)
@@ -190,9 +231,11 @@ class MeshCollisionChecker:
             elif typ != 'fixed':
                 raise ValueError(f'Unsupported joint type: {typ}')
             transforms[joint.find('child').get('link')] = transforms[joint.find('parent').get('link')] @ transform
-        return np.array([transforms[name] for name in self.names])
+        return np.array([transforms[name] for name in (self.names if link_names is None else link_names)])
 
     def check(self, positions: Mapping[str, float]) -> MeshCollision | None:
+        if getattr(self, 'skip_fcl_checks', False):
+            return None
         transforms = self._transforms(positions)
         for obj, transform in zip(self.objects, transforms):
             obj.setTransform(self.fcl.Transform(transform[:3, :3], transform[:3, 3]))
@@ -213,6 +256,30 @@ class MeshCollisionChecker:
         for name, (obj, bounds) in self.environment.items():
             overlap = ((high >= bounds[0]) & (bounds[1] >= low)).all(1)
             for i in np.flatnonzero(overlap):
+                if self.names[i] in getattr(self, "environment_ignore_links", set()):
+                    continue
                 if intersects(self.objects[i], obj):
                     return MeshCollision('environment', self.names[i], name)
+        return self._check_payload(positions, transforms)
+
+    def _check_payload(self, positions, robot_transforms):
+        payload = getattr(self, 'payload', None)
+        if payload is None:
+            return None
+        from curobo_ros_python.planning.payload import outside_box
+        transform = self._transforms(positions, [payload.tool])[0] @ payload.in_tool
+        obj = self.fcl.CollisionObject(self.fcl.Box(*payload.size),
+            self.fcl.Transform(transform[:3, :3], transform[:3, 3]))
+        side = payload.group.split('_')[0]
+        allowed = {payload.tool, side+'_gripper_base', side+'_gripper_left_jaw', side+'_gripper_right_jaw'}
+        for name, robot_obj in zip(self.names, self.objects):
+            if name in allowed:
+                continue
+            result = self.fcl.CollisionResult()
+            if self.fcl.collide(obj, robot_obj, self.fcl.CollisionRequest(), result):
+                return MeshCollision('payload_self', 'payload', name)
+        for name, (environment_obj, bounds) in self.environment.items():
+            result = self.fcl.CollisionResult()
+            if self.fcl.collide(obj, environment_obj, self.fcl.CollisionRequest(), result):
+                return MeshCollision('payload_environment', 'payload', name)
         return None

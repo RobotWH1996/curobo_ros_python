@@ -140,6 +140,7 @@ def publish_collision_world(node, points) -> bool:
             points,
             pitch=node.pointcloud_pitch,
             frame_id=node.pointcloud_parent_frame or node.base_frame,
+            body_points=getattr(node, "_self_filter_removed_points", None),
         )
     )
     return True

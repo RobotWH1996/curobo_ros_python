@@ -52,6 +52,7 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 import fcl
 import trimesh
+import rtree
 import yaml
 import rclpy
 from curobo.config_io import load_yaml
@@ -63,7 +64,7 @@ links = {node.get('name') for node in ET.parse(urdf).getroot().findall('link')}
 missing = set(cfg['collision_link_names']) - links
 assert not missing, f'URDF collision links missing: {missing}'
 assert 'camera_01_link' in links, 'Update cuRobo to camera rename commit 1ebff3b or newer'
-policy = root / 'src/curobo_ros_python/curobo_ros_python/planning/lycus_fcl_collision.yaml'
+policy = root / 'src/curobo_ros_python/config/lycus_fcl_collision.yaml'
 assert isinstance(yaml.safe_load(policy.read_text())['self_collision_ignore'], dict)
 # Exercise the installed FCL binding, not only the Python import.
 a = fcl.CollisionObject(fcl.Box(1., 1., 1.))

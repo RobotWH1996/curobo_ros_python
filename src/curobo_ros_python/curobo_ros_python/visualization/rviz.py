@@ -22,6 +22,7 @@ _YELLOW = ColorRGBA(r=1.0, g=0.85, b=0.05, a=1.0)
 _WHITE = ColorRGBA(r=0.92, g=0.92, b=0.92, a=1.0)
 _RED = ColorRGBA(r=1.0, g=0.15, b=0.1, a=1.0)
 _BLUE = ColorRGBA(r=0.15, g=0.35, b=1.0, a=1.0)
+_BODY_BLUE = ColorRGBA(r=0.15, g=0.35, b=1.0, a=0.7)
 _NS = "curobo_traj"
 _MPC_NS = "curobo_mpc"
 _WORLD_NS = "curobo_world"
@@ -279,42 +280,77 @@ def empty_display(model_id: str = "", frame_id: str = "base_link") -> DisplayTra
     return msg
 
 
+def _finite_xyz(points) -> np.ndarray:
+    pts = np.zeros((0, 3), dtype=np.float64) if points is None else np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if pts.shape[0] == 0:
+        return pts
+    return pts[np.isfinite(pts).all(axis=1)]
+
+
+def _voxel_indices(points: np.ndarray, origin: np.ndarray, pitch: float) -> np.ndarray:
+    if points.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.int64)
+    ijk = np.floor((points - origin) / pitch).astype(np.int64)
+    return np.unique(ijk, axis=0)
+
+
+def _drop_shared_voxels(environment: np.ndarray, body: np.ndarray) -> np.ndarray:
+    """同一格子里有本体点时只留蓝色，避免橙色盖住被滤除的区间。"""
+    if environment.shape[0] == 0 or body.shape[0] == 0:
+        return environment
+    env = np.ascontiguousarray(environment)
+    banned = np.ascontiguousarray(body)
+    kind = np.dtype((np.void, env.dtype.itemsize * env.shape[1]))
+    keep = ~np.isin(env.view(kind).ravel(), banned.view(kind).ravel())
+    return env[keep]
+
+
+def _limit_voxels(ijk: np.ndarray, max_voxels: int) -> np.ndarray:
+    if ijk.shape[0] <= max_voxels:
+        return ijk
+    chosen = np.linspace(0, ijk.shape[0] - 1, max_voxels).astype(np.int64)
+    return ijk[chosen]
+
+
+def _voxel_cubes(frame_id: str, marker_id: int, color: ColorRGBA, ijk: np.ndarray, origin: np.ndarray, pitch: float) -> Marker:
+    centers = (ijk.astype(np.float64) + 0.5) * pitch + origin
+    cubes = Marker()
+    cubes.header.frame_id = frame_id
+    cubes.ns = _WORLD_NS
+    cubes.id = marker_id
+    cubes.type = Marker.CUBE_LIST
+    cubes.action = Marker.ADD
+    cubes.pose.orientation.w = 1.0
+    cubes.scale.x = cubes.scale.y = cubes.scale.z = pitch
+    cubes.color = color
+    cubes.lifetime.sec = 0
+    cubes.points = [Point(x=float(p[0]), y=float(p[1]), z=float(p[2])) for p in centers]
+    return cubes
+
+
 def collision_voxels_to_markers(
     points: np.ndarray,
     pitch: float,
     frame_id: str = "base_link",
     max_voxels: int = _MAX_VOXEL_MARKERS,
+    body_points: Optional[np.ndarray] = None,
 ) -> MarkerArray:
-    """把点云体素化结果画成 CUBE_LIST，对应 Mesh.from_pointcloud 的占用格子。"""
+    """把点云体素画成 CUBE_LIST。环境格子是橙色，被判为本体内的格子是蓝色。"""
     array = MarkerArray()
     array.markers.append(_delete_all(frame_id, _WORLD_NS))
 
-    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
     pitch = max(float(pitch), 1e-4)
-    if pts.shape[0] == 0:
+    environment = _finite_xyz(points)
+    body = _finite_xyz(body_points)
+    if environment.shape[0] == 0 and body.shape[0] == 0:
         return array
-    finite = np.isfinite(pts).all(axis=1)
-    pts = pts[finite]
-    if pts.shape[0] == 0:
-        return array
-    origin = pts.min(axis=0) - pitch
-    ijk = np.floor((pts - origin) / pitch).astype(np.int64)
-    ijk = np.unique(ijk, axis=0)
-    if ijk.shape[0] > max_voxels:
-        sel = np.linspace(0, ijk.shape[0] - 1, max_voxels).astype(np.int64)
-        ijk = ijk[sel]
-    centers = (ijk.astype(np.float64) + 0.5) * pitch + origin
-
-    cubes = Marker()
-    cubes.header.frame_id = frame_id
-    cubes.ns = _WORLD_NS
-    cubes.id = 1
-    cubes.type = Marker.CUBE_LIST
-    cubes.action = Marker.ADD
-    cubes.pose.orientation.w = 1.0
-    cubes.scale.x = cubes.scale.y = cubes.scale.z = pitch
-    cubes.color = _ORANGE
-    cubes.lifetime.sec = 0
-    cubes.points = [Point(x=float(p[0]), y=float(p[1]), z=float(p[2])) for p in centers]
-    array.markers.append(cubes)
+    origin = np.vstack((environment, body)).min(axis=0) - pitch
+    body_ijk = _voxel_indices(body, origin, pitch)
+    environment_ijk = _drop_shared_voxels(_voxel_indices(environment, origin, pitch), body_ijk)
+    body_ijk = _limit_voxels(body_ijk, max_voxels)
+    environment_ijk = _limit_voxels(environment_ijk, max_voxels)
+    if environment_ijk.shape[0]:
+        array.markers.append(_voxel_cubes(frame_id, 1, _ORANGE, environment_ijk, origin, pitch))
+    if body_ijk.shape[0]:
+        array.markers.append(_voxel_cubes(frame_id, 2, _BODY_BLUE, body_ijk, origin, pitch))
     return array

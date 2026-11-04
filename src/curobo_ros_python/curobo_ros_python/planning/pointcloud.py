@@ -33,6 +33,20 @@ def _xyz_from_cloud(msg: PointCloud2) -> np.ndarray:
     return np.stack((arr["x"], arr["y"], arr["z"]), axis=1)
 
 
+def _protected_labels(msg: PointCloud2) -> np.ndarray:
+    """Positive perception labels are objects and must survive robot masking."""
+    n=int(msg.width)*int(msg.height)
+    field=next((f for f in msg.fields if f.name=='label'),None)
+    if field is None: return np.zeros(n,dtype=bool)
+    formats={PointField.INT8:'i1',PointField.UINT8:'u1',PointField.INT16:'i2',
+             PointField.UINT16:'u2',PointField.INT32:'i4',PointField.UINT32:'u4'}
+    if field.datatype not in formats or field.count!=1: raise ValueError('点云 label 字段须为单个整数')
+    endian='>' if msg.is_bigendian else '<'
+    dtype=np.dtype({'names':['label'],'formats':[endian+formats[field.datatype]],
+                    'offsets':[field.offset],'itemsize':int(msg.point_step)})
+    return np.frombuffer(msg.data,dtype=dtype,count=n)['label']>0
+
+
 def _filter_and_downsample(
     pts: np.ndarray,
     min_range: float,
@@ -92,13 +106,41 @@ def cloud_to_base_points(
     filter_cloud: bool = False,
     bounds_min: Optional[Sequence[float]] = None,
     bounds_max: Optional[Sequence[float]] = None,
+    point_filter=None,
+    preserve_labeled_points: bool = False,
 ) -> Tuple[np.ndarray, int]:
     raw = _xyz_from_cloud(msg)
     n_raw = int(raw.shape[0])
-    pts = _filter_and_downsample(raw, min_range, max_range, pitch, max_points) if filter_cloud else raw
+    def planning_points():
+        # Keep the original ordering and sensor-frame voxel grid exactly.
+        result = _filter_and_downsample(raw, min_range, max_range, pitch, max_points) if filter_cloud else raw
+        if translation is not None and quat_wxyz is not None:
+            result = transform_points(result, translation, quat_wxyz)
+        return crop_bounds(result, bounds_min, bounds_max)
+
+    if point_filter is None:
+        return planning_points(), n_raw
+
+    finite = np.isfinite(raw).all(1)
+    if filter_cloud:
+        distance = np.linalg.norm(raw, axis=1)
+        finite &= (distance > min_range) & (distance < max_range)
+    pts = raw[finite]
+    protected = _protected_labels(msg)[finite] if preserve_labeled_points else None
     if translation is not None and quat_wxyz is not None:
         pts = transform_points(pts, translation, quat_wxyz)
-    return crop_bounds(pts, bounds_min, bounds_max), n_raw
+    if bounds_min is not None and bounds_max is not None:
+        inside=(pts>=np.asarray(bounds_min)).all(1)&(pts<=np.asarray(bounds_max)).all(1)
+        pts=pts[inside]
+        if protected is not None: protected=protected[inside]
+    filtered = point_filter(pts,protected) if preserve_labeled_points else point_filter(pts)
+    # Callback contract: returning the same array means observation or fallback.
+    # Only an applied mask returns a new array, including a valid empty result.
+    if filtered is pts:
+        return planning_points(), n_raw
+    if filter_cloud:
+        filtered = _filter_and_downsample(filtered, -1., float('inf'), pitch, max_points)
+    return filtered, n_raw
 
 
 def exclude_boxes_from_param(value) -> Optional[np.ndarray]:

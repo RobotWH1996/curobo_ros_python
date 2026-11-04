@@ -36,6 +36,7 @@ class MpcFollower:
         self._last_warn_right = 0.0
         self._cloud_note = ""
         self._loaded_pc_seq = None
+        self._filter_retry_seq = None
 
     def on_target(self, msg: MpcTarget):
         self._target = msg
@@ -154,7 +155,7 @@ class MpcFollower:
             with node._pc_lock:
                 has_cloud = node._pc_msg is not None
             if not node.use_pointcloud or not node.pointcloud_topic or has_cloud:
-                error = self._sync_world(mpc, publish=False)
+                error = self._sync_world(mpc, publish=False, group_name=mode)
                 if error:
                     node.get_logger().warn(f"MPC 预热等待点云：{error}", throttle_duration_sec=5.0)
                     return False
@@ -206,9 +207,18 @@ class MpcFollower:
             return now
         return last_ts
 
-    def _sync_world(self, mpc, publish: bool = True) -> Optional[str]:
+    def _sync_world(self, mpc, publish: bool = True, group_name=None) -> Optional[str]:
         node = self._node
         self._cloud_note = ""
+        if group_name is None:
+            target = getattr(self, '_target', None)
+            left = bool(target is not None and target.has_left)
+            right = bool(target is not None and target.has_right)
+            group_name = 'left_arm' if left and not right else 'right_arm' if right and not left else 'both_arms'
+        if getattr(self, '_loaded_pc_group', None) != group_name:
+            self._loaded_pc_seq = None
+            self._filter_retry_seq = None
+            self._loaded_pc_group = group_name
         if not node.use_pointcloud or not node.pointcloud_topic:
             return None
         with node._pc_lock:
@@ -216,10 +226,12 @@ class MpcFollower:
             seq = int(node._pc_seq)
         if msg is None:
             return f"无点云：尚未收到 {node.pointcloud_topic}"
-        if seq == self._loaded_pc_seq:
+        if seq == self._loaded_pc_seq and seq != self._filter_retry_seq:
             self._cloud_note = f"点云未更新 seq={seq}"
             return None
         src = (msg.header.frame_id or "").lstrip("/")
+        if node.self_filter_mode == 'off':
+            node._self_filter_removed_points = np.zeros((0, 3), np.float32)
         try:
             translation, quat_wxyz = node._lookup_cloud_tf(src)
         except TransformException as exc:
@@ -236,9 +248,18 @@ class MpcFollower:
                 filter_cloud=node.filter_pointcloud,
                 bounds_min=node.pointcloud_bounds_min,
                 bounds_max=node.pointcloud_bounds_max,
+                point_filter=(lambda points: node._filter_robot_points(msg, points, group_name))
+                    if node.self_filter_mode != 'off' else None,
             )
         except Exception as exc:  # noqa: BLE001
             return f"解析点云失败: {exc}"
+        # A loaded fallback scene is valid, but its self mask still needs retry.
+        self._filter_retry_seq = (
+            seq if node.self_filter_mode != 'off' and not node._self_filter_succeeded else None
+        )
+        if self._filter_retry_seq == seq and self._loaded_pc_seq == seq:
+            self._cloud_note = f'本体过滤待重试 seq={seq}，保留已加载场景'
+            return None
         if pts.shape[0] == 0:
             self._clear_loaded_world(mpc, seq, "这一帧没有可用点", publish=publish)
             return None

@@ -10,6 +10,8 @@ import threading
 import time
 from typing import Any, Dict, Optional, Sequence, Tuple
 
+import numpy as np
+
 import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
@@ -40,6 +42,7 @@ from curobo_ros_python.planning.convert import (
     stamped_to_pose,
 )
 from curobo_ros_python.planning.mpc_follow import MpcFollower
+from curobo_ros_python.planning.self_filter import SelfFilterMixin
 from curobo_ros_python.planning.pointcloud import (
     cloud_to_base_points,
     drop_boxes,
@@ -76,6 +79,9 @@ _PARAM_DEFAULTS: Dict[str, Any] = {
     "planned_trajectory_topic": "/curobo/planned_trajectory",
     "trajectory_marker_topic": "",
     "use_pointcloud": True,
+    "self_filter_mode": "off",
+    "self_filter_padding": 0.01,
+    "self_filter_max_processing_ms": 100.0,
     "visualize_trajectory": True,
     "compute_ee_paths": True,
     "visualize_mesh_obstacles": True,
@@ -158,7 +164,7 @@ class _LapTimer:
         return f"{segs} total={self.total_ms():.1f}"
 
 
-class CuroboMotionPlanningNode(Node):
+class CuroboMotionPlanningNode(SelfFilterMixin, Node):
     def __init__(self):
         super().__init__("curobo_motion_planning_node")
         self._service_group = MutuallyExclusiveCallbackGroup()
@@ -166,7 +172,8 @@ class CuroboMotionPlanningNode(Node):
         self._action_group = ReentrantCallbackGroup()
         self._gpu_lock = threading.Lock()
         self._mpc_start_lock = threading.Lock()
-        for name, default in _PARAM_DEFAULTS.items():
+        from curobo_ros_python.planning.pick_place_server import DEFAULTS as PICK_PLACE_DEFAULTS
+        for name, default in {**_PARAM_DEFAULTS, **PICK_PLACE_DEFAULTS}.items():
             self.declare_parameter(name, default)
 
         self.execute_trajectory = bool(self._p("execute_trajectory"))
@@ -192,7 +199,7 @@ class CuroboMotionPlanningNode(Node):
         self.get_logger().info(
             f"可视化 {'开' if self.visualize_trajectory else '关'}，"
             f"目标路点 {'开' if self.visualize_goal_waypoints else '关'}，"
-            f"仿真/调试执行 {'开' if self.execute_trajectory else '关'}"
+            f"控制器下发 {'开' if self.execute_trajectory else '关'}"
         )
         self.pointcloud_collision = self._collision_mode()
         self.pointcloud_voxel_dims, self.pointcloud_voxel_center = self._voxel_box()
@@ -233,6 +240,7 @@ class CuroboMotionPlanningNode(Node):
             trajopt_num_iters=int(self._p("trajopt_num_iters")),
             finetune_attempts=int(self._p("trajopt_finetune_attempts")),
             logger=self.get_logger(),
+            self_filter_geometry=str(self._p('self_filter_mode')) != 'off',
         )
         self.executor_helper = None
         if self.execute_trajectory:
@@ -241,6 +249,8 @@ class CuroboMotionPlanningNode(Node):
             )
 
         self._joint_map: Dict[str, float] = {}
+        self._joint_received = {}
+        self._pc_received = 0.0
         self._mpc_following = False
         self._mpc_preparing = False
         self._mpc_ready_logged = False
@@ -325,6 +335,8 @@ class CuroboMotionPlanningNode(Node):
             cancel_callback=self._follow_mpc_cancel,
             callback_group=self._action_group,
         )
+        from curobo_ros_python.planning.pick_place_server import PickPlaceServer
+        self._manipulation = PickPlaceServer(self)
         self._mpc_prewarm_timer = None
         self._initialization_logged = False
         if bool(self._p("mpc_prewarm")):
@@ -343,9 +355,26 @@ class CuroboMotionPlanningNode(Node):
         if self._initialization_logged:
             return
         self._initialization_logged = True
+        dispatch = "开" if self.execute_trajectory and self.executor_helper is not None else "关"
         self.get_logger().info(
-            "服务已就绪: plan_joint_goal / plan_pose_goal / compute_ik；"
-            "Action: follow_mpc（目标 /curobo/target，结果 /curobo/mpc_plan）"
+            "规划与执行: 服务和 Action 都先规划出轨迹。"
+            f"控制器下发{dispatch}（execute_trajectory）。"
+            "关时只把轨迹发到话题，不驱动机械臂和夹爪；"
+            "开时规划成功后调用 FollowJointTrajectory。"
+            "抓放与 OPT 共用启动配置：debug 默认执行，deploy 默认只输出；整次任务规划成功后才下发。"
+        )
+        self.get_logger().info(
+            "服务已就绪: /plan_joint_goal /plan_pose_goal /compute_ik"
+        )
+        self.get_logger().info(
+            "Action 已就绪: /follow_mpc（目标 "
+            f"{self._p('mpc_target_topic')}，结果 {self._p('mpc_plan_topic')}）、"
+            "/pick /place /pick_place"
+        )
+        self.get_logger().info(
+            f"规划轨迹话题: {self._traj_topic}；"
+            f"关节状态: {self._p('joint_states_topic')}；"
+            f"控制器切换 {'开' if self._p('switch_controllers') else '关'}"
         )
         self.get_logger().info("========== cuRobo Motion Planning Node 初始化完成 ==========")
 
@@ -395,6 +424,9 @@ class CuroboMotionPlanningNode(Node):
         self._pc_msg: Optional[PointCloud2] = None
         self._pc_seq = 0
         self._last_world_pts = None
+        self._setup_self_filter()
+        if self.self_filter_mode == 'off':
+            self.get_logger().info('[本体过滤] mode=off，不做本体分类；仍执行常规点云预处理')
 
         if not self.use_pointcloud:
             self.get_logger().info("点云碰撞未启用（use_pointcloud:=false），规划按空场景")
@@ -440,6 +472,7 @@ class CuroboMotionPlanningNode(Node):
 
     def _on_joint_state(self, msg: JointState):
         self._joint_map.update(joint_map_from_msg(msg.name, msg.position))
+        self._joint_received.update({name: time.monotonic() for name in msg.name})
         stamp = msg.header.stamp
         t = float(stamp.sec) + float(stamp.nanosec) * 1e-9
         if t <= 0.0:
@@ -449,6 +482,7 @@ class CuroboMotionPlanningNode(Node):
     def _on_pointcloud(self, msg: PointCloud2):
         with self._pc_lock:
             self._pc_msg = msg
+            self._pc_received = time.monotonic()
             self._pc_seq += 1
 
     def _pc_skip_or_fail(self, err: str, *, empty_scene_note: bool = False) -> Optional[str]:
@@ -511,13 +545,14 @@ class CuroboMotionPlanningNode(Node):
         )
         return f"计时 {parts}"
 
-    def _sync_world_from_pointcloud(self, group_name: Optional[str] = None) -> Optional[str]:
+    def _sync_world_from_pointcloud(self, group_name: Optional[str] = None, *, prepared_cloud=None) -> Optional[str]:
         started = time.perf_counter()
         if not self.use_pointcloud or not self.pointcloud_topic:
             self._world_timing = {"cloud": 0.0, "scene": 0.0}
             return None
+        self._last_prepared_cloud = None
         with self._pc_lock:
-            msg = self._pc_msg
+            msg = self._pc_msg if prepared_cloud is None else prepared_cloud[0]
         if msg is None:
             self._mark_world_timing(started)
             return self._pc_skip_or_fail(
@@ -527,31 +562,64 @@ class CuroboMotionPlanningNode(Node):
         src = (msg.header.frame_id or "").lstrip("/")
         child = self.pointcloud_child_frame or src
         parent = self.pointcloud_parent_frame
-        try:
-            translation, quat_wxyz = self._lookup_cloud_tf(src)
-        except TransformException as exc:
-            err = (
-                f"没有 TF {child} -> {parent}，点云无法进规划坐标系。详情: {exc}"
+        if prepared_cloud is None:
+            if self.self_filter_mode == 'off':
+                self._self_filter_removed_points = np.zeros((0, 3), np.float32)
+            try:
+                translation, quat_wxyz = self._lookup_cloud_tf(src)
+            except TransformException as exc:
+                err = (
+                    f"没有 TF {child} -> {parent}，点云无法进规划坐标系。详情: {exc}"
+                )
+                self._mark_world_timing(started)
+                return self._pc_skip_or_fail(err, empty_scene_note=True)
+            try:
+                pts, n_raw = cloud_to_base_points(
+                    msg,
+                    translation,
+                    quat_wxyz,
+                    min_range=self.pointcloud_min_range,
+                    max_range=self.pointcloud_max_range,
+                    pitch=self.pointcloud_pitch,
+                    max_points=self.pointcloud_max_points,
+                    filter_cloud=self.filter_pointcloud,
+                    bounds_min=self.pointcloud_bounds_min,
+                    bounds_max=self.pointcloud_bounds_max,
+                    preserve_labeled_points=True,
+                    point_filter=(lambda points, protected: self._filter_robot_points(msg, points, group_name or 'both_arms', protected=protected))
+                        if self.self_filter_mode != 'off' else None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._mark_world_timing(started)
+                return self._pc_skip_or_fail(f"解析点云失败: {exc}")
+        else:
+            msg, pts, n_raw = prepared_cloud
+            saved_body = getattr(self, "_last_prepared_body", None)
+            self._self_filter_removed_points = (
+                np.zeros((0, 3), np.float32) if saved_body is None
+                else np.array(saved_body, dtype=np.float32, copy=True)
             )
-            self._mark_world_timing(started)
-            return self._pc_skip_or_fail(err, empty_scene_note=True)
-        try:
-            pts, n_raw = cloud_to_base_points(
-                msg,
-                translation,
-                quat_wxyz,
-                min_range=self.pointcloud_min_range,
-                max_range=self.pointcloud_max_range,
-                pitch=self.pointcloud_pitch,
-                max_points=self.pointcloud_max_points,
-                filter_cloud=self.filter_pointcloud,
-                bounds_min=self.pointcloud_bounds_min,
-                bounds_max=self.pointcloud_bounds_max,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._mark_world_timing(started)
-            return self._pc_skip_or_fail(f"解析点云失败: {exc}")
+        # Capture before payload/static masking; one offline task reuses this
+        # immutable sensor snapshot, while each new request still reads live data.
+        self._last_prepared_cloud = (msg, pts, n_raw)
+        removed = getattr(self, "_self_filter_removed_points", None)
+        self._last_prepared_body = (
+            np.zeros((0, 3), np.float32) if removed is None
+            else np.array(removed, dtype=np.float32, copy=True)
+        )
+        payload_filter_all_removed = False
+        if getattr(self, "_manipulation", None) is not None:
+            had_points = bool(len(pts))
+            pts = self._manipulation.filter_cloud(pts)
+            payload_filter_all_removed = had_points and not len(pts)
         if pts.shape[0] == 0:
+            if payload_filter_all_removed or (self.self_filter_mode == 'apply' and getattr(self, '_self_filter_all_removed', False)):
+                self.planner.clear_pointcloud_world(group_name)
+                self._last_world_pts = pts
+                from curobo_ros_python.visualization.publish import publish_collision_world
+                publish_collision_world(self, pts)
+                self._mark_world_timing(started)
+                return None
             empty_msg = (
                 "点云滤波后为空，未更新碰撞场景"
                 if self.filter_pointcloud
@@ -634,6 +702,12 @@ class CuroboMotionPlanningNode(Node):
                 self._mpc_preparing = False
 
     def _follow_mpc_goal(self, _request):
+        if self.executor_helper is not None and self.executor_helper.execution_pending:
+            return GoalResponse.REJECT
+        manipulation = getattr(self, "_manipulation", None)
+        if manipulation is not None and manipulation.busy:
+            self.get_logger().warn("抓放任务进行中，不允许切入MPC")
+            return GoalResponse.REJECT
         with self._mpc_start_lock:
             if self._mpc_preparing:
                 self.get_logger().warn("MPC 正在提前预热，请等待 MPC ready 后再启动跟踪")
@@ -797,13 +871,13 @@ class CuroboMotionPlanningNode(Node):
                 if self._mpc_reached(feedback, pos_tol, ori_tol):
                     result.success = True
                     result.message = "已到达目标容差"
-                    self.get_logger().info(result.message)
+                    self.get_logger().info(f'[MPC] event=完成 status=成功 elapsed_s={time.monotonic()-started:.2f} reason={result.message!r}')
                     goal_handle.succeed()
                     return result
                 total_ms = (time.monotonic() - cycle_t0) * 1000.0
                 segs = " ".join(f"{k}={v:.1f}" for k, v in laps.items())
                 self.get_logger().info(
-                    f"MPC 周期(ms): {segs} total={total_ms:.1f}",
+                    f"[MPC] event=周期 timing_ms=({segs}) total_ms={total_ms:.1f} budget_ms={period*1000:.1f}",
                     throttle_duration_sec=2.0,
                 )
                 remain = period - (time.monotonic() - cycle_t0)
@@ -841,13 +915,15 @@ class CuroboMotionPlanningNode(Node):
         if angles:
             response.joint_angles = []
         if log:
-            self.get_logger().error(message)
+            self.get_logger().error(f'[规划] event=失败 reason={message!r}')
+        else:
+            self.get_logger().warn(f'[规划] event=拒绝 reason={message!r}')
         return response
 
     def _log_group_current(self, group_name: str):
         joints = GROUP_JOINTS[group_name]
         cur = [self._joint_map.get(n, float("nan")) for n in joints]
-        self.get_logger().info(f"  当前 {group_name}: {_fmt_named_joints(joints, cur)}")
+        self.get_logger().debug(f"  当前 {group_name}: {_fmt_named_joints(joints, cur)}")
 
     def _pose_in_base(self, pose: PoseStamped) -> PoseStamped:
         src = (pose.header.frame_id or self.base_frame).lstrip("/")
@@ -902,7 +978,7 @@ class CuroboMotionPlanningNode(Node):
         response.message = f"{planned.message}；{note}" if note else planned.message
         planned.message = response.message
         if not planned.success:
-            self.get_logger().error(f"规划失败 [{group_name}]: {planned.message}")
+            self.get_logger().error(f"[OPT] group={group_name} status=失败 reason={planned.message!r}")
             if timer is not None:
                 self._log_laps("TrajOpt", group_name, timer)
             return
@@ -915,7 +991,7 @@ class CuroboMotionPlanningNode(Node):
             planned.trajectory.position.reshape(-1, planned.trajectory.position.shape[-1]).shape[0]
         )
         self.get_logger().info(
-            f"规划成功 [{group_name}]: {planned.message}（{n_pts} 点）"
+            f"[OPT] group={group_name} status=规划成功 points={n_pts} detail={planned.message!r}"
         )
         traj = curobo_traj_to_msg(
             planned.trajectory,
@@ -952,7 +1028,7 @@ class CuroboMotionPlanningNode(Node):
             except Exception as exc:  # noqa: BLE001
                 self.get_logger().warn(f"末端轨迹 FK 失败，RViz 绿线可能没有: {exc}")
         published.extend(publish_trajopt(self, traj, ee_paths))
-        self.get_logger().info("已发布 " + "、".join(published))
+        self.get_logger().debug("已发布 " + "、".join(published))
         if timer is not None:
             timer.lap("preview")
         if not self.execute_trajectory or self.executor_helper is None:
@@ -987,7 +1063,8 @@ class CuroboMotionPlanningNode(Node):
             return self._reject(response, "规划器正忙")
         try:
             self.get_logger().info(
-                f"收到 PlanJointGoal: group={request.group_name}, waypoints={len(request.waypoints)}"
+                f"[OPT] event=开始 type=joint group={request.group_name} waypoints={len(request.waypoints)} "
+                f"mode={'execute' if self.execute_trajectory else 'preview'} self_filter={self.self_filter_mode}"
             )
             timer = _LapTimer()
             self._world_timing = {"cloud": 0.0, "scene": 0.0}
@@ -995,7 +1072,7 @@ class CuroboMotionPlanningNode(Node):
             joints = GROUP_JOINTS[request.group_name]
             self._log_group_current(request.group_name)
             for i, wp in enumerate(request.waypoints):
-                self.get_logger().info(f"  目标路点[{i}]: {_fmt_named_joints(joints, wp.positions)}")
+                self.get_logger().debug(f"  目标路点[{i}]: {_fmt_named_joints(joints, wp.positions)}")
             try:
                 current = self._current_curobo_state()
                 goals = [
@@ -1107,10 +1184,10 @@ class CuroboMotionPlanningNode(Node):
             for i, (pose, pose_other) in enumerate(zip(request.waypoints, other)):
                 pose, xyz, xyzw, extra = self._pose_to_xyz_xyzw(pose)
                 pose_other, xyz2, xyzw2, extra2 = self._pose_to_xyz_xyzw(pose_other)
-                self.get_logger().info(
+                self.get_logger().debug(
                     f"  路点[{i}] {ee}: {_fmt_pose(xyz, xyzw, pose.header.frame_id)}{extra}"
                 )
-                self.get_logger().info(
+                self.get_logger().debug(
                     f"  路点[{i}] {other_ee}: {_fmt_pose(xyz2, xyzw2, pose_other.header.frame_id)}{extra2}"
                 )
                 viz.append((ee, pose))
@@ -1129,7 +1206,7 @@ class CuroboMotionPlanningNode(Node):
         viz = []
         for i, pose in enumerate(request.waypoints):
             pose, xyz, xyzw, extra = self._pose_to_xyz_xyzw(pose)
-            self.get_logger().info(
+            self.get_logger().debug(
                 f"  目标路点[{i}]: {_fmt_pose(xyz, xyzw, pose.header.frame_id)}{extra}"
             )
             viz.append((ee, pose))
@@ -1140,7 +1217,8 @@ class CuroboMotionPlanningNode(Node):
         other = list(getattr(request, "other_waypoints", []) or [])
         other_ee = (getattr(request, "other_ee_link", "") or "").strip()
         self.get_logger().info(
-            f"收到 PlanPoseGoal: group={request.group_name}, waypoints={len(request.waypoints)}, "
+            f"[OPT] event=开始 type=pose group={request.group_name} waypoints={len(request.waypoints)} "
+            f"mode={'execute' if self.execute_trajectory else 'preview'} self_filter={self.self_filter_mode} "
             f"ee_link={request.ee_link or '(默认)'}"
             + (f", other_waypoints={len(other)}" if other else "")
         )
@@ -1194,7 +1272,7 @@ class CuroboMotionPlanningNode(Node):
         if not self._gpu_lock.acquire(blocking=False):
             return self._reject(response, "规划器正忙", angles=True)
         try:
-            self.get_logger().info(f"收到 ComputeIK: group={request.group_name}")
+            self.get_logger().info(f"[IK] event=开始 group={request.group_name}")
             self._log_group_current(request.group_name)
             timer = _LapTimer()
             try:
@@ -1205,7 +1283,7 @@ class CuroboMotionPlanningNode(Node):
                     return self._reject(response, pc_err, log=True, angles=True)
                 pose = self._pose_in_base(request.pose)
                 xyz, xyzw = _pose_xyz_xyzw(pose)
-                self.get_logger().info(f"  目标位姿: {_fmt_pose(xyz, xyzw, pose.header.frame_id)}")
+                self.get_logger().debug(f"  目标位姿: {_fmt_pose(xyz, xyzw, pose.header.frame_id)}")
                 current = self._current_curobo_state()
                 goal_pose = stamped_to_pose(pose, self.planner.device_cfg)
                 timer.lap("convert")
@@ -1228,6 +1306,9 @@ class CuroboMotionPlanningNode(Node):
                     planned.solution, request.group_name, self._joint_map
                 )
             timer.lap("pack")
+            message=f'[IK] group={request.group_name} success={planned.success} reason={planned.message!r}'
+            if planned.success: self.get_logger().info(message)
+            else: self.get_logger().error(message)
             self._log_laps("IK", request.group_name, timer)
             return response
         finally:

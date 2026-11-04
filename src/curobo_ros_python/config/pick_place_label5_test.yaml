@@ -1,0 +1,120 @@
+# label5 测试配置：25 cm 预置/抬升/撤退，放回本次记录的抓取位置。
+# pick 的 tool_pose 默认仍由 /obj_poses 更新；place 是本次场景固定快照。
+timeout: 180.0
+pick:
+  group_name: left_arm
+  tool_pose:
+    header:
+      frame_id: camera_01_color_optical_frame
+      stamp:
+        sec: 1793686532
+        nanosec: 868926078
+    pose:
+      position:
+        x: -0.2309921830892563
+        y: 0.11002662777900696
+        z: 0.8964295387268066
+      orientation:
+        x: 0.895111620426178
+        y: -0.0014828341081738472
+        z: -0.0029771507252007723
+        w: 0.4458296597003937
+  waypoints: []
+  in_base_frame: false
+  prepick_in_target:
+    position:
+      x: 0.0
+      y: 0.0
+      z: 0.25
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+  pick_pose:
+    position:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+  lift_in_target:
+    position:
+      x: 0.0
+      y: 0.0
+      z: 0.25
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+  end_pose:
+    type: ''
+  object_size:
+    x: 0.205217
+    y: 0.222
+    z: 0.0581
+  open_position: 0.0
+  close_position: -0.025
+  gripper_duration: 0.5
+place:
+  group_name: left_arm
+  tool_pose:
+    header:
+      stamp:
+        sec: 0
+        nanosec: 0
+      frame_id: base_link
+    pose:
+      position:
+        x: 0.7018723149674031
+        y: 0.25768298232555387
+        z: 0.8616045767636007
+      orientation:
+        x: -0.03701326383680713
+        y: 0.03995684207743602
+        z: -0.7081857393021105
+        w: 0.7039221465719405
+  waypoints: []
+  in_base_frame: false
+  preplace_in_target:
+    position:
+      x: 0.0
+      y: 0.0
+      z: 0.25
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+  place_pose:
+    position:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+  retreat_in_target:
+    position:
+      x: 0.0
+      y: 0.0
+      z: 0.25
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+  end_pose:
+    type: ''
+  object_size:
+    x: 0.205217
+    y: 0.222
+    z: 0.0581
+  open_position: 0.0
+  gripper_duration: 0.5

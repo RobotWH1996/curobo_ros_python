@@ -10,6 +10,12 @@ find_package(trajectory_msgs REQUIRED)
 find_package(action_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/MotionWaypoint.msg"
+  "msg/PickTask.msg"
+  "msg/PlaceTask.msg"
+  "action/Pick.action"
+  "action/Place.action"
+  "action/PickPlace.action"
   "msg/JointWaypoint.msg"
   "msg/MpcTarget.msg"
   "msg/MpcArmResult.msg"

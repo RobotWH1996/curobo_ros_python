@@ -50,6 +50,7 @@ class GripperStateUpdater:
         self._limits = {}
         self._fingers = []
         self._bindings = {}
+        self._model_signature = None
         self._previous = None
         for name in self.joint_names:
             limit = joints[name].find("limit")
@@ -98,6 +99,12 @@ class GripperStateUpdater:
                 raise ValueError(f"实测关节 {name}={q} 超出 URDF 限位 [{lower}, {upper}]")
             positions[name] = min(upper, max(lower, q))
         changed = positions != self._previous
+        signature = tuple((id(model.config.kinematics_config.fixed_transforms),
+                           id(model.lock_jointstate.position) if model.lock_jointstate is not None else None,
+                           tuple(model.joint_names))
+                          for model in models)
+        if not changed and signature == self._model_signature:
+            return False
         matrices = self._matrices(positions)
         if not models:
             raise RuntimeError("没有可更新的夹爪运动学模型")
@@ -136,6 +143,7 @@ class GripperStateUpdater:
                         if tensor is not None:
                             tensor[..., column] = 0.0
         self._previous = positions
+        self._model_signature = signature
         return changed
 
 

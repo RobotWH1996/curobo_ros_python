@@ -1,0 +1,18 @@
+curobo_ros_interfaces/PickTask task
+# Execution is controlled by the node debug/deploy configuration.
+# Whole-task timeout; zero uses node default.
+float64 timeout
+---
+bool success
+bool execution_requested
+bool execution_completed
+string message
+string stage
+# Complete time-aligned body + gripper trajectory; independent, non-mimic joints.
+trajectory_msgs/JointTrajectory trajectory
+# Same joint order, per-stage local time; useful for inspection.
+trajectory_msgs/JointTrajectory[] trajectories
+string[] trajectory_stages
+---
+string stage
+string message

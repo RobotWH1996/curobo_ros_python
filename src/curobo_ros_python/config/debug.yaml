@@ -24,6 +24,17 @@ curobo_motion_planning_node:
     planned_trajectory_topic: /curobo/planned_trajectory  # TrajOpt 关节轨迹发布
     trajectory_marker_topic: ""         # 末端绿线 MarkerArray；空则为 /{robot}_motion_trajectory
 
+    # --- Pick/独立 Place 默认工件几何：Action 省略时读取；请按实际工件设置 ---
+    pick_place_default_object_size: [0.0, 0.0, 0.0] # 米；0 为未配置占位，使用前必须填三个正尺寸
+
+    # 抓放先规划完整轨迹，再跟随 execute_trajectory：debug 下发仿真控制器，deploy 只发布。
+    # 统一从 joint_states_topic 读取本体和夹爪初始状态；不创建夹爪专用命令/反馈话题。
+    pick_place_timeout: 180.0           # Action.timeout=0 时的总规划超时，秒
+    pick_place_joint_state_max_age: 1.0 # 离线规划起点反馈最大年龄，秒
+    pick_place_cloud_max_age: 2.0       # 离线规划初始点云最大年龄，秒
+    pick_place_path_tolerance: 0.01     # 接近/抬升/撤退直线允许偏差，米
+    pick_place_max_placed_objects: 16   # 本次离线任务已放置物体容量
+
     # --- 可视化（调试开）---
     visualize_trajectory: true          # true：TrajOpt 绿线 + MPC 预测末端/目标球 + /display_planned_path
     compute_ee_paths: true              # true：TrajOpt 对规划轨迹做 FK 出末端路径（绿线需要它）
@@ -32,6 +43,9 @@ curobo_motion_planning_node:
 
     # --- 点云碰撞 ---
     use_pointcloud: true                # false：不订点云，按空场景规划
+    self_filter_mode: "apply"             # off / observe（仅可视化）/ apply（实际删点）；启动参数
+    self_filter_padding: 0.05           # mesh表面向外距离，m；可能误删贴近本体的障碍
+    self_filter_max_processing_ms: 300.0 # 单帧几何过滤预算，ms；超时整帧保留，非硬实时限制
     pointcloud_topic: /all_points       # 点云；空字符串则不用点云碰撞
     pointcloud_collision: mesh         # TrajOpt 点云碰撞：mesh 三角网格，voxel 距离场。MPC 仍用网格
     pointcloud_voxel_dims: [2.0, 2.0, 2.0]      # voxel 时盒子边长 (m)，base_link。mesh 时忽略

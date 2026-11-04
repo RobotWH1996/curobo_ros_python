@@ -27,6 +27,7 @@ class FixedJointStateUpdater:
         self.positions = {name: float(q) for name, q in defaults.items()}
         self._joints = []
         self._bindings = {}
+        self._model_signature = None
         for name in defaults:
             joint = joints[name]
             kind = joint.get('type')
@@ -72,6 +73,12 @@ class FixedJointStateUpdater:
             if not math.isfinite(positions[name]):
                 raise ValueError(f'Non-finite fixed joint feedback: {name}')
         changed = positions != self.positions
+        signature = tuple((id(model.config.kinematics_config.fixed_transforms),
+                           id(model.lock_jointstate.position) if model.lock_jointstate is not None else None,
+                           tuple(model.joint_names))
+                          for model in models)
+        if not changed and signature == self._model_signature:
+            return False
         if not self._joints:
             return False
         if not models:
@@ -115,4 +122,5 @@ class FixedJointStateUpdater:
                         if tensor is not None:
                             tensor[..., column] = 0.
         self.positions = positions
+        self._model_signature = signature
         return changed

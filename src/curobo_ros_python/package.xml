@@ -9,6 +9,7 @@
 
   <depend>curobo_ros_interfaces</depend>
   <depend>rclpy</depend>
+  <exec_depend>rosidl_runtime_py</exec_depend>
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
   <exec_depend>python3-numpy</exec_depend>

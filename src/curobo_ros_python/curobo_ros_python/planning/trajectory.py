@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import copy
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -64,6 +65,24 @@ def numpy_traj_to_msg(
 
 def joint_map_from_msg(names: Iterable[str], positions: Iterable[float]) -> Dict[str, float]:
     return {n: float(p) for n, p in zip(names, positions)}
+
+
+def select_trajectory_joints(trajectory: JointTrajectory, names: Sequence[str]) -> JointTrajectory:
+    """Select controller columns while preserving the planned stage timing."""
+    missing = [name for name in names if name not in trajectory.joint_names]
+    if missing:
+        raise ValueError(f'轨迹缺少控制器关节: {missing}')
+    indices = [trajectory.joint_names.index(name) for name in names]
+    result = JointTrajectory(joint_names=list(names))
+    result.header.frame_id = trajectory.header.frame_id
+    for point in trajectory.points:
+        out = JointTrajectoryPoint(time_from_start=copy.deepcopy(point.time_from_start))
+        for field in ('positions', 'velocities', 'accelerations', 'effort'):
+            values = getattr(point, field)
+            if values:
+                setattr(out, field, [values[index] for index in indices])
+        result.points.append(out)
+    return result
 
 
 def combine_joint_trajectories(
@@ -185,9 +204,11 @@ def shift_trajectory_time(trajectory: JointTrajectory, offset_sec: float) -> Joi
     return out
 
 
-def _wait_future(future, timeout_sec: float) -> bool:
+def _wait_future(future, timeout_sec: float, cancel_check=None) -> bool:
     deadline = time.monotonic() + timeout_sec
     while not future.done():
+        if cancel_check is not None and cancel_check():
+            return False
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.01)
@@ -198,10 +219,11 @@ class TrajectoryExecutor:
     def __init__(self, node: Node, switch_controllers: bool = True):
         self._node = node
         self._switch = switch_controllers
-        self._clients = {
-            group: ActionClient(node, FollowJointTrajectory, action)
-            for group, action in GROUP_ACTION.items()
-        }
+        self._actions = {**GROUP_ACTION,
+                'left_gripper': '/left_gripper_controller/follow_joint_trajectory',
+                'right_gripper': '/right_gripper_controller/follow_joint_trajectory'}
+        self._clients = {group: ActionClient(node, FollowJointTrajectory, action)
+                         for group, action in self._actions.items()}
         self._switch_client = node.create_client(
             SwitchController, "/controller_manager/switch_controller"
         )
@@ -209,9 +231,19 @@ class TrajectoryExecutor:
         self._handles: Dict[str, object] = {}
         self._send_futs: List[object] = []
         self._ready_groups: set = set()
+        self._unresolved_execution = None
+        self._execution_fault = False
+        self._awaiting_goal_ack = False
+
+    @property
+    def execution_pending(self) -> bool:
+        future = self._unresolved_execution
+        return self._execution_fault or self._awaiting_goal_ack or (future is not None and not future.done())
 
     def switch_group(self, group_name: str, timeout_sec: float = 3.0) -> bool:
-        if not self._switch or group_name not in GROUP_CONTROLLER_SWITCH:
+        if group_name not in GROUP_CONTROLLER_SWITCH:
+            return True
+        if not self._switch:
             self._last_group = group_name
             return True
         if group_name == self._last_group:
@@ -243,6 +275,9 @@ class TrajectoryExecutor:
 
     def send_replace(self, group_name: str, trajectory: JointTrajectory) -> None:
         """异步下发并顶替上一拍，不等待执行结束。"""
+        if self.execution_pending:
+            self._node.get_logger().warn("上一条执行尚未确认停止，拒绝MPC顶替")
+            return
         if trajectory is None or not trajectory.points:
             return
         client = self._clients.get(group_name)
@@ -257,7 +292,7 @@ class TrajectoryExecutor:
         if group_name not in self._ready_groups:
             if not client.server_is_ready() and not client.wait_for_server(timeout_sec=0.05):
                 self._node.get_logger().warn(
-                    f"Action 不可用: {GROUP_ACTION[group_name]}",
+                    f"Action 不可用: {self._actions[group_name]}",
                     throttle_duration_sec=2.0,
                 )
                 return
@@ -265,7 +300,7 @@ class TrajectoryExecutor:
         elif not client.server_is_ready():
             self._ready_groups.discard(group_name)
             self._node.get_logger().warn(
-                f"Action 已断开: {GROUP_ACTION[group_name]}，本周期跳过",
+                f"Action 已断开: {self._actions[group_name]}，本周期跳过",
                 throttle_duration_sec=2.0,
             )
             return
@@ -332,7 +367,12 @@ class TrajectoryExecutor:
         group_name: str,
         trajectory: JointTrajectory,
         timeout_sec: float = 60.0,
+        cancel_check=None,
     ) -> tuple[bool, str]:
+        if self.execution_pending:
+            return False, "上一段轨迹尚未确认停止，拒绝发送新轨迹"
+        if cancel_check is not None and cancel_check():
+            return False, "执行前已取消或超时"
         if trajectory is None or not trajectory.points:
             return False, "轨迹为空"
         client = self._clients.get(group_name)
@@ -341,20 +381,47 @@ class TrajectoryExecutor:
         if not self.switch_group(group_name):
             return False, "控制器切换失败"
         if not client.wait_for_server(timeout_sec=2.0):
-            return False, f"Action 不可用: {GROUP_ACTION[group_name]}"
+            return False, f"Action 不可用: {self._actions[group_name]}"
+
+        if cancel_check is not None and cancel_check():
+            return False, "发送轨迹前已取消或超时"
 
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = trajectory
         send_future = client.send_goal_async(goal)
-        if not _wait_future(send_future, 5.0):
+        if not _wait_future(send_future, min(5.0, timeout_sec), cancel_check):
+            self._awaiting_goal_ack = True
+            self._unresolved_execution = send_future
+            def cancel_late(future):
+                try:
+                    late = future.result()
+                    if late is not None and late.accepted:
+                        late.cancel_goal_async()
+                        self._unresolved_execution = late.get_result_async()
+                    else:
+                        self._unresolved_execution = None
+                except Exception:
+                    self._execution_fault = True
+                finally:
+                    self._awaiting_goal_ack = False
+            send_future.add_done_callback(cancel_late)
             return False, "发送轨迹目标超时"
         handle = send_future.result()
         if handle is None or not handle.accepted:
             return False, "控制器拒绝轨迹"
         result_future = handle.get_result_async()
-        if not _wait_future(result_future, timeout_sec):
+        if not _wait_future(result_future, timeout_sec, cancel_check):
+            self._unresolved_execution = result_future
+            handle.cancel_goal_async()
+            # Do not send the next segment while a canceled segment still runs.
+            _wait_future(result_future, 3.0)
             return False, "等待轨迹执行超时"
-        wrapped = result_future.result()
+        try:
+            wrapped = result_future.result()
+        except Exception as exc:
+            self._execution_fault = True
+            handle.cancel_goal_async()
+            return False, f"控制器结果异常，停止状态未确认: {exc}"
         if wrapped is None:
             return False, "执行结果为空"
         if getattr(wrapped, "status", GoalStatus.STATUS_SUCCEEDED) != GoalStatus.STATUS_SUCCEEDED:
