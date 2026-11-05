@@ -299,13 +299,18 @@ ros2 launch curobo_ros_python curobo_motion_planning_deploy.launch.py log_level:
 
 每个任务使用 Action Goal UUID 标识。按 task 查找同一次请求的阶段、碰撞策略、求解耗时和最终结果；phase 区分 Pick/Place 中同名阶段。
 
-- 接触阶段的 `fcl=skip` 表示跳过关键点 FCL；GPU 对未豁免部件继续避障。
-- `fingers=ignore` 仅针对两片夹指，`payload=ignore` 针对当前接触区间工件。
+- `method=cartesian_interpolation` 表示中段用连续 IK 插补；`self_collision=off world_collision=off fcl=off` 表示该段不检查碰撞，仍检查运动学和关节动态限位。
+- `method=opt fcl=keypoints gpu_collision=on` 表示外段使用正常 GPU 轨迹避障和 FCL 关键点检查。
 - `state_ms/world_ms/solve_ms` 分别为状态同步、场景更新、OPT 求解耗时；segment_ms 为本段总耗时，不能与子项重复相加。
 - `trajectory_s` 表示计划运动时长；任务 elapsed_ms 包含规划、当前模式的控制器执行及清理耗时。
 - 夹爪张开/闭合/释放的规划日志说明生成插补轨迹；execute_* 阶段和执行完成日志说明控制器下发及结果。success 按当前启动模式判断，不表示实际夹到物体。
 
 输入、初始反馈和忙状态拒绝发生在阶段计算前。失败时先看最后的 stage/reason，再看对应 FCL 或 OPT 日志。普通 OPT/MPC 的控制器执行日志仍按原接口输出。
+
+失败明细区分初始点、路点和目标点，并列出碰撞类型及双方连杆/障碍名称。环境点云生成的网格统一命名为 `environment`，该名字代表整份环境点云，不代表摄像头部件。
+
+IK 未到达目标时写作“目标点的IK候选碰撞”；失败优化轨迹的末端写作“目标点的失败轨迹末端候选碰撞”，不把候选构型当作实际目标状态。后段失败以已完成上一段的终点作为起点。失败轨迹最多抽查8个点、输出4条碰撞明细；这是失败诊断，不是整条轨迹的 FCL 验收，未报告碰撞也不证明轨迹无碰撞。诊断耗时不计入后续 IK 候选筛选统计，成功规划不运行这段诊断。
+
 
 ### 本体点云过滤与 MPC
 

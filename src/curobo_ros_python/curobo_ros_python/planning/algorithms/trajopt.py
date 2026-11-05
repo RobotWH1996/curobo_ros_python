@@ -49,6 +49,50 @@ class TrajResult:
     status: Optional[str] = None
 
 
+_COLLISION_KIND = {
+    "self": "自碰撞",
+    "environment": "环境碰撞",
+    "payload_self": "携物自碰撞",
+    "payload_environment": "携物环境碰撞",
+}
+
+
+def waypoint_collision_label(index: int, count: int) -> str:
+    """0 是初始点，最后一个是目标点，中间依次是路点1、路点2。"""
+    if index <= 0:
+        return "初始点"
+    if count <= 1 or index >= count - 1:
+        return "目标点"
+    return f"路点{index}"
+
+
+def segment_collision_labels(index: int, count: int) -> Tuple[str, str]:
+    """第 index 段的两端。count 是目标路点个数，最后一段的终点是目标点。"""
+    start = "初始点" if index <= 0 else f"路点{index}"
+    end = "目标点" if count <= 1 or index >= count - 1 else f"路点{index + 1}"
+    return start, end
+
+
+def trajectory_sample_label(index: int, count: int, start: str, end: str) -> str:
+    if index <= 0:
+        return start
+    if index >= count - 1:
+        return end
+    return f"{start}到{end}的轨迹第{index + 1}/{count}点"
+
+
+def format_collision_pair(kind: str, first: str, second: str) -> str:
+    return f"{_COLLISION_KIND.get(kind, kind)} {first} / {second}"
+
+
+def trajectory_sample_indices(count: int, limit: int = 8) -> List[int]:
+    if count <= 0:
+        return []
+    if count <= limit:
+        return list(range(count))
+    return sorted({int(round(i * (count - 1) / (limit - 1))) for i in range(limit)})
+
+
 def _unique(names: Sequence[str]) -> List[str]:
     seen = set()
     out: List[str] = []
@@ -431,7 +475,7 @@ class CuroboPlanner:
                    ("; 无成功IK候选可检查" if checked == 0 else "") +
                    (f"; 首个碰撞={rejected[0].kind}: {rejected[0].first} / {rejected[0].second}" if rejected else ""))
 
-    def _check_mesh_endpoint(self, state: JointState, label: str = "输出终点") -> Optional[str]:
+    def _check_mesh_endpoint(self, state: JointState, label: str = "目标点") -> Optional[str]:
         if getattr(self._mesh_checker, "skip_fcl_checks", False):
             return None
         started = time.perf_counter()
@@ -445,12 +489,12 @@ class CuroboPlanner:
         finally:
             self._fcl_candidate_ms = previous_ms
         elapsed_ms = (time.perf_counter() - started) * 1000
-        detail = "自碰撞通过" if hit is None else f"碰撞={hit.kind}: {hit.first} / {hit.second}"
+        detail = "通过" if hit is None else f"碰撞: {format_collision_pair(hit.kind, hit.first, hit.second)}"
         self._info(f"FCL {label}: {'通过' if hit is None else '拒绝'}, {detail}; "
                    f"环境={self._fcl_environment_label()}, 耗时={elapsed_ms:.2f}ms")
         if hit is None:
             return None
-        return f"FCL 目标状态碰撞 ({hit.kind}): {hit.first} / {hit.second}"
+        return f"{label}碰撞: {format_collision_pair(hit.kind, hit.first, hit.second)}"
 
     def _urdf_path(self, robot: str) -> str:
         from curobo.config_io import load_yaml
@@ -565,7 +609,7 @@ class CuroboPlanner:
         self,
         points,
         pitch: float = 0.02,
-        name: str = "cam",
+        name: str = "environment",
         group_name: Optional[str] = None,
     ) -> int:
         from curobo._src.geom.types import Mesh, SceneCfg
@@ -585,12 +629,12 @@ class CuroboPlanner:
         if not pending:
             return n
         if self._cloud_sig != sig or self._cloud_vertices is None:
-            built = Mesh.from_pointcloud(pts, pitch=pitch, name=name or "cam")
+            built = Mesh.from_pointcloud(pts, pitch=pitch, name=name or "environment")
             self._cloud_vertices = np.ascontiguousarray(built.vertices, dtype=np.float32)
             self._cloud_faces = np.ascontiguousarray(built.faces, dtype=np.int32)
             self._cloud_sig = sig
             self._cloud_loaded = {}
-        mesh_name = name or "cam"
+        mesh_name = name or "environment"
         if self._cloud_fcl_sig != (sig, mesh_name):
             fcl_mesh = Mesh(name=mesh_name, pose=[0., 0., 0., 1., 0., 0., 0.],
                             vertices=self._cloud_vertices, faces=self._cloud_faces)
@@ -629,7 +673,7 @@ class CuroboPlanner:
         pitch: float,
         dims: Sequence[float],
         center: Sequence[float],
-        name: str = "cam",
+        name: str = "environment",
     ) -> Tuple[int, int]:
         """把点云写成固定格子的距离场。返回 (输入点数, 落在盒子里的点数)。"""
         import numpy as np
@@ -646,12 +690,12 @@ class CuroboPlanner:
         high = low + np.asarray(dims_s)
         inside = pts[((pts >= low) & (pts < high)).all(1)]
         fcl_scene = self._mesh_checker.prepare_scene(Scene(mesh=[
-            Mesh.from_pointcloud(inside, pitch=pitch, name=name or "cam")])) if len(inside) else {}
+            Mesh.from_pointcloud(inside, pitch=pitch, name=name or "environment")])) if len(inside) else {}
         cx, cy, cz = (float(v) for v in center)
         feature = torch.from_numpy(np.ascontiguousarray(esdf))
         for motion in self._planners.values():
             grid = VoxelGrid(
-                name=name or "cam",
+                name=name or "environment",
                 pose=[cx, cy, cz, 1.0, 0.0, 0.0, 0.0],
                 dims=[float(v) for v in dims_s],
                 voxel_size=float(pitch),
@@ -705,6 +749,126 @@ class CuroboPlanner:
             self._log.warn(msg)
         else:
             print("WARN:", msg, flush=True)
+
+    def _collision_hit(self, state: Optional[JointState]) -> Optional[MeshCollision]:
+        if state is None or getattr(self._mesh_checker, "skip_fcl_checks", False):
+            return None
+        position = state.position.detach().reshape(-1, state.position.shape[-1])[-1].cpu().tolist()
+        names = list(state.joint_names or [])
+        if len(names) != len(position):
+            return None
+        return self._check_mesh_candidate(dict(zip(names, position)))
+
+    def _ik_collision_state(self, motion, ik_result) -> Optional[JointState]:
+        if ik_result is None or getattr(ik_result, "solution", None) is None:
+            return None
+        solution = ik_result.solution.detach().reshape(-1, ik_result.solution.shape[-1])
+        if solution.numel() == 0:
+            return None
+        index = 0
+        error = getattr(ik_result, "position_error", None)
+        if error is not None and error.numel() > 0:
+            flat = error.detach().reshape(-1)
+            count = min(int(solution.shape[0]), int(flat.shape[0]))
+            if count > 0:
+                index = int(torch.argmin(flat[:count]).item())
+        names = list(getattr(getattr(motion, "ik_solver", None), "joint_names", []) or [])
+        if len(names) != int(solution.shape[-1]):
+            return None
+        return JointState.from_position(solution[index].reshape(1, -1), joint_names=names)
+
+    def _trajectory_rows(self, result):
+        state = getattr(result, "js_solution", None)
+        if state is None or getattr(state, "position", None) is None:
+            state = getattr(result, "interpolated_trajectory", None)
+        if state is None or getattr(state, "position", None) is None:
+            return None, None
+        position = state.position.detach()
+        names = list(state.joint_names or [])
+        seed = 0
+        rank = getattr(result, "seed_rank", None)
+        if rank is not None:
+            try:
+                seed = max(int(rank.detach().reshape(-1)[0].item()), 0)
+            except Exception:
+                seed = 0
+        if position.ndim == 4:
+            seed = seed if seed < position.shape[1] else 0
+            position = position[0, seed]
+        elif position.ndim == 3:
+            if position.shape[0] == 1:
+                position = position[0]
+            else:
+                seed = seed if seed < position.shape[0] else 0
+                position = position[seed]
+        if position.ndim != 2 or position.shape[0] < 1:
+            return None, None
+        if len(names) != int(position.shape[-1]):
+            return None, None
+        return position, names
+
+    def _with_collision_detail(
+        self,
+        message: str,
+        result,
+        current: Optional[JointState],
+        goals: Optional[Sequence[JointState]] = None,
+        failed_index: Optional[int] = None,
+        n_goals: int = 1,
+    ) -> str:
+        """失败时补充碰撞发生在初始点、路点还是目标点，以及相撞的两侧。"""
+        if getattr(self._mesh_checker, "skip_fcl_checks", False):
+            return message
+        previous_ms = getattr(self, "_fcl_candidate_ms", 0.0)
+        try:
+            notes: List[str] = []
+            checked = set()
+            found_interior = False
+            start, end = segment_collision_labels(
+                0 if failed_index is None else int(failed_index), max(int(n_goals), 1)
+            )
+
+            def record(label: str, state: Optional[JointState], interior: bool = False) -> None:
+                nonlocal found_interior
+                if state is None or (interior and found_interior) or (not interior and label in checked):
+                    return
+                if not interior:
+                    checked.add(label)
+                hit = self._collision_hit(state)
+                if hit is None:
+                    return
+                notes.append(f"{label}碰撞: {format_collision_pair(hit.kind, hit.first, hit.second)}")
+                if interior:
+                    found_interior = True
+
+            record(start, current)
+            if goals:
+                count = len(goals) + 1
+                for index, goal in enumerate(goals):
+                    record(waypoint_collision_label(index + 1, count), goal)
+            rows, names = self._trajectory_rows(result)
+            if rows is None and result is None:
+                motion = self._motion or self.planner
+                record(f"{end}的IK候选", self._ik_collision_state(motion, getattr(motion, "last_ik_result", None)))
+            if rows is not None:
+                total = int(rows.shape[0])
+                for index in trajectory_sample_indices(total):
+                    label = trajectory_sample_label(index, total, start, end)
+                    if index == total - 1:
+                        label = f"{end}的失败轨迹末端候选"
+                    interior = 0 < index < total - 1
+                    row = rows[index].detach().reshape(1, -1)
+                    record(label, JointState.from_position(row, joint_names=names), interior)
+                    if len(notes) >= 4:
+                        break
+            if notes:
+                message += "；" + "；".join(notes[:4])
+        except Exception as exc:
+            message += f"；碰撞明细检查失败: {exc}"
+        finally:
+            # Failure diagnostics must not enter the next IK-filter timing.
+            self._fcl_candidate_ms = previous_ms
+        return message
 
     def _fail(self, message: str) -> TrajResult:
         candidates = getattr(self, "last_fcl_candidates", {})
@@ -863,9 +1027,8 @@ class CuroboPlanner:
     ) -> TrajResult:
         if result is None or not result.success.any():
             motion = self._motion or self.planner
-            return self._fail(
-                f"规划失败: {format_plan_failure(result, motion.last_ik_result)}"
-            )
+            message = f"规划失败: {format_plan_failure(result, motion.last_ik_result)}"
+            return self._fail(self._with_collision_detail(message, result, hold_state))
         traj = result.get_interpolated_plan()
         if traj is None:
             return self._fail("规划成功但插值轨迹为空")
@@ -889,7 +1052,26 @@ class CuroboPlanner:
         n_wp: int,
     ) -> TrajResult:
         if wp_result.success is None or not wp_result.success.any():
-            return self._fail(f"规划失败: {wp_result.status}")
+            failed_index = getattr(wp_result, "failed_index", None)
+            message = f"规划失败: {wp_result.status}"
+            if failed_index is not None:
+                start, end = segment_collision_labels(int(failed_index), n_wp)
+                message = f"规划失败: {start}到{end}；{wp_result.status}"
+            segment_start = hold_state
+            if failed_index not in (None, 0):
+                segment_start = None
+                segments = getattr(wp_result, "segment_trajectories", None)
+                if segments:
+                    previous = segments[-1]
+                    position = previous.position.reshape(-1, previous.position.shape[-1])[-1:]
+                    segment_start = JointState.from_position(position, joint_names=previous.joint_names)
+            return self._fail(self._with_collision_detail(
+                message,
+                getattr(wp_result, "failed_result", None),
+                segment_start,
+                failed_index=failed_index,
+                n_goals=n_wp,
+            ))
         if wp_result.interpolated_trajectory is None:
             return self._fail("规划成功但轨迹为空")
         return self._make_plan_output(
@@ -967,10 +1149,16 @@ class CuroboPlanner:
         # 单臂求解器的活动关节不含被锁的另一臂。目标仍按双臂关节名组装，FK 要求名字完全一致。
         goals = [self._active(goal) for goal in goals]
         hold_joints = [n for n in self.joint_names if n not in group_joints]
+        collision_hits = []
+        point_count = len(goals) + 1
         for index, goal in enumerate(goals):
-            collision_error = self._check_mesh_endpoint(goal, label=f"关节目标[{index + 1}/{len(goals)}]")
+            collision_error = self._check_mesh_endpoint(
+                goal, label=waypoint_collision_label(index + 1, point_count)
+            )
             if collision_error:
-                return self._fail(collision_error)
+                collision_hits.append(collision_error)
+        if collision_hits:
+            return self._fail("规划失败: " + "；".join(collision_hits))
         if len(goals) == 1:
             result = motion.plan_cspace(
                 goals[0],

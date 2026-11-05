@@ -366,9 +366,9 @@ class DualArmMpc:
         self.prepare_tracking(current_state)
         self.prewarmed = True
 
-    def update_world_from_points(self, points: np.ndarray, pitch: float, name: str = "cam") -> int:
+    def update_world_from_points(self, points: np.ndarray, pitch: float, name: str = "environment") -> int:
         pts = np.asarray(points, dtype=np.float32).reshape(-1, 3)
-        mesh = Mesh.from_pointcloud(pts, pitch=float(pitch), name=name or "cam")
+        mesh = Mesh.from_pointcloud(pts, pitch=float(pitch), name=name or "environment")
         checker = self.mpc.core.scene_collision_checker
         if checker is None:
             raise RuntimeError("MPC 没有 scene collision checker，无法更新点云环境")
@@ -384,12 +384,12 @@ class DualArmMpc:
             del old
         return int(pts.shape[0])
 
-    def clear_world(self, name: str = "cam") -> None:
+    def clear_world(self, name: str = "environment") -> None:
         """去掉当前碰撞网格。用于一帧有效点云里已经没有障碍。"""
         checker = self.mpc.core.scene_collision_checker
         if checker is None:
             raise RuntimeError("MPC 没有 scene collision checker，无法清空碰撞场景")
-        mesh_name = name or "cam"
+        mesh_name = name or "environment"
         old = pop_cached_mesh(checker, mesh_name)
         try:
             checker.clear_cache()

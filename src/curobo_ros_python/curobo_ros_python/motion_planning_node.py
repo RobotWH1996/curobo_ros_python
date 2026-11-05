@@ -646,7 +646,7 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
                 )
         else:
             n_used = self.planner.update_world_from_points(
-                pts, pitch=self.pointcloud_pitch, name="cam", group_name=group_name
+                pts, pitch=self.pointcloud_pitch, name="environment", group_name=group_name
             )
         self._mark_world_timing(started, scene_started)
         self._last_world_pts = pts

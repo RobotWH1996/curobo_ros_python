@@ -53,11 +53,11 @@ class ContactTest(unittest.TestCase):
     def test_pointcloud_flat_faces_reach_native_fcl(self):
         from curobo._src.geom.types import Mesh,SceneCfg
         checker=MeshCollisionChecker.__new__(MeshCollisionChecker);checker.fcl=fcl
-        mesh=Mesh.from_pointcloud(np.array([[0.,0.,0.],[.03,0.,0.]],dtype=np.float32),pitch=.02,name='cam')
+        mesh=Mesh.from_pointcloud(np.array([[0.,0.,0.],[.03,0.,0.]],dtype=np.float32),pitch=.02,name='environment')
         scene=checker.prepare_scene(SceneCfg(mesh=[mesh]))
-        self.assertIn('cam',scene)
+        self.assertIn('environment',scene)
         result=fcl.CollisionResult()
-        hit=fcl.collide(scene['cam'][0],fcl.CollisionObject(fcl.Box(.05,.05,.05)),fcl.CollisionRequest(),result)
+        hit=fcl.collide(scene['environment'][0],fcl.CollisionObject(fcl.Box(.05,.05,.05)),fcl.CollisionRequest(),result)
         self.assertGreater(hit,0)
 
 
