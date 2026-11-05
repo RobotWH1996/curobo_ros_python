@@ -17,7 +17,9 @@ from curobo_ros_python.planning.geom import quat_mul_wxyz, transform_pose_wxyz
 from curobo_ros_python.planning.payload import Payload, pose_matrix, outside_box, resolve_object_geometry
 from curobo_ros_python.planning.pick_collision import set_payload
 from curobo_ros_python.planning.convert import stamped_to_pose, numpy_traj_to_msg, group_goal_state, joint_map_to_curobo
-from curobo_ros_python.planning.offline_trajectory import gripper_segment, concatenate_segments
+from curobo_ros_python.planning.offline_trajectory import (
+    blend_through, continuous_runs, gripper_segment, concatenate_segments,
+    overlay_joint_motion, insert_stationary_hold, sample_trajectory, ros_duration)
 from curobo.trajectory_optimizer import expand_joint_trajectory
 from curobo_ros_python.planning.groups import GROUP_JOINTS
 from curobo_ros_python.planning.trajectory import select_trajectory_joints
@@ -26,11 +28,20 @@ from curobo_ros_python.planning.trajectory import select_trajectory_joints
 DEFAULTS={
     'pick_place_default_object_size':[0.0,0.0,0.0],
     'pick_place_timeout':180.,
+    'gripper_wait_time':1.0,
+    'keep_tool_z_vertical':False,
     'pick_place_joint_state_max_age':1.,
     'pick_place_cloud_max_age':2.,
     'pick_place_path_tolerance':.01,
     'pick_place_max_placed_objects':16,
 }
+
+
+def gripper_wait_time(value):
+    value=float(value)
+    if not math.isfinite(value) or value<0:
+        raise ValueError('gripper_wait_time 必须是有限非负秒数')
+    return value
 
 
 def xyz(vector):
@@ -78,13 +89,12 @@ def validate_common(task):
     if task.group_name not in ('left_arm','right_arm'):
         raise ValueError('首版抓放Action只支持 left_arm/right_arm；原双臂多目标规划服务保留')
     if not math.isfinite(float(task.open_position)): raise ValueError('open_position 必须是有限关节位置')
-    if not math.isfinite(task.gripper_duration) or task.gripper_duration<=0:
-        raise ValueError('gripper_duration 必须为有限正秒数')
 
 
 class PickPlaceServer:
     def __init__(self,node):
         self.node=node
+        gripper_wait_time(node._p('gripper_wait_time'))
         for name in ('pick_place_timeout','pick_place_joint_state_max_age',
                      'pick_place_cloud_max_age','pick_place_path_tolerance'):
             value=float(node._p(name))
@@ -109,6 +119,7 @@ class PickPlaceServer:
 
     def accept(self,kind,request):
         try:
+            gripper_wait_time(self.node._p('gripper_wait_time'))
             timeout=float(request.timeout)
             if not math.isfinite(timeout) or timeout<0: raise ValueError('timeout必须为有限非负数')
             tasks=(request.pick,request.place) if kind=='pick_place' else (request.task,)
@@ -169,15 +180,23 @@ class PickPlaceServer:
             elif kind=='place': runner.place(handle.request.task)
             else: runner.pick_place(handle.request.pick,handle.request.place)
             backend.check()
+            backend.merge_continuous_motions(task.group_name)
+            backend.check()
             result.trajectory=concatenate_segments(backend.trajectories)
             result.trajectory.header.frame_id=self.node.base_frame
             result.trajectory.header.stamp=self.node.get_clock().now().to_msg()
             self.node._traj_pub.publish(result.trajectory)
-            if self.node.execute_trajectory:
-                backend.execute_plan(task.group_name)
-                result.execution_completed=True
             result.success=True
-            result.message='完整轨迹规划及控制器执行成功' if result.execution_completed else '完整轨迹已发布；当前启动配置不下发控制器'
+            result.message='完整轨迹已发布；当前启动配置不下发控制器'
+            if self.node.execute_trajectory:
+                try:
+                    submitted,message=backend.execute_plan(task.group_name,result.trajectory)
+                    result.message='完整轨迹规划成功；'+message
+                except Exception as exc:
+                    result.message=f'完整轨迹规划成功；控制层提交异常: {exc}'
+                    self.node.get_logger().warn(result.message)
+                # Submission does not assert that the physical execution completed.
+                result.execution_completed=False
         except TaskCancelled as exc:
             result.message=str(exc)
         except Exception as exc:
@@ -214,8 +233,10 @@ class TaskBackend:
     def __init__(self,server,handle,action):
         self.server=server;self.node=server.node;self.p=self.node.planner
         self.handle=handle;self.action=action
+        self.p.keep_tool_z_vertical=bool(self.node._p('keep_tool_z_vertical'))
         timeout=float(handle.request.timeout) or float(self.node._p('pick_place_timeout'))
         self.deadline=time.monotonic()+timeout
+        self.gripper_wait_time=gripper_wait_time(self.node._p('gripper_wait_time'))
         self.stage='validate'
         self.released_key=None
         self.trajectories=[];self.trajectory_stages=[]
@@ -226,9 +247,14 @@ class TaskBackend:
         self.saved_mesh_scenes=dict(self.p._mesh_scenes)
         self.saved_fcl_environment=self.p._mesh_checker.environment
         self.virtual_state=None
+        self._feedback_checked=False
         self._world_checked=False
         self._prepared_cloud=None
         self._return_segments={}
+        self._open_along={}
+        self._pending_open=None
+        self._segment_checks=[]
+        self._open_collision_joint=None
         self._changed_groups=set()
         self.virtual_joints=dict(self.node._joint_map)
         self.joint_names=[j.get('name') for j in self.p._mesh_checker.ordered
@@ -254,24 +280,12 @@ class TaskBackend:
         if level=='debug': self.node.get_logger().debug(message)
         else: self.node.get_logger().info(message)
 
-    def execute_plan(self,group):
-        """Dispatch only after every task stage has been planned successfully."""
-        executor=self.node.executor_helper
-        for stage,full in zip(self.trajectory_stages,self.trajectories):
-            self.feedback('execute_'+stage)
-            self.check()
-            gripper=stage in ('open','close','release')
-            controller_group=group.split('_')[0]+'_gripper' if gripper else group
-            names=[controller_group] if gripper else GROUP_JOINTS[group]
-            trajectory=select_trajectory_joints(full,names)
-            timeout=min(self.node.execute_timeout,self.deadline-time.monotonic())
-            if timeout<=0: raise TimeoutError('任务执行超时')
-            ok,message=executor.execute(controller_group,trajectory,timeout_sec=timeout,
-                cancel_check=lambda:self.handle.is_cancel_requested or not rclpy.ok() or time.monotonic()>self.deadline)
-            if not ok:
-                self.check()
-                raise RuntimeError(f'{stage} 控制器执行失败: {message}')
-            self.log('执行完成',f'controller={controller_group} points={len(trajectory.points)}')
+    def execute_plan(self,group,full):
+        """Hand one complete offline timeline to the control adapter, without waits."""
+        joint=group.split('_')[0]+'_gripper'
+        return self.node.executor_helper.dispatch([
+            (group,select_trajectory_joints(full,GROUP_JOINTS[group])),
+            (joint,select_trajectory_joints(full,[joint]))])
 
     def _preflight(self,task):
         validate_common(task)
@@ -286,6 +300,7 @@ class TaskBackend:
         self._validate_gripper_target(task,task.open_position)
 
     def _validate_joint_feedback(self):
+        if self._feedback_checked: return
         # Require every observed joint used by full-body FCL, not defaults.
         names=[j.get('name') for j in self.p._mesh_checker.ordered
                if j.get('type')!='fixed' and j.find('mimic') is None]
@@ -297,6 +312,7 @@ class TaskBackend:
         now=time.monotonic();ages=self.node._joint_received
         stale=[name for name in names if now-ages.get(name,0)>self.node._p('pick_place_joint_state_max_age')]
         if stale: raise RuntimeError(f'初始关节反馈过期: {stale}')
+        self._feedback_checked=True
 
     def validate_pair(self,pick,place):
         if pick.group_name!=place.group_name:
@@ -434,8 +450,15 @@ class TaskBackend:
         if self.virtual_state is None:
             self.virtual_state,_=joint_map_to_curobo(self.p.joint_names,self.virtual_joints,self.p.device,
                                                     default_position=self.p.default_joint_position)
-        self.p.update_gripper_state(self.virtual_joints)
+        self.p.update_gripper_state(self._collision_joints())
         return self.virtual_state.clone()
+
+    def _collision_joints(self):
+        values=dict(self.virtual_joints)
+        if self._open_collision_joint is not None:
+            joint=self._open_collision_joint
+            values[joint]=self.p._gripper_state._limits[joint][1]
+        return values
 
     def _world(self,group):
         if self.node.use_pointcloud:
@@ -493,7 +516,7 @@ class TaskBackend:
             planned=self.p.plan_pose(group,current,[{group+'_ee_link':pose}],max_attempts=3)
         solved=time.monotonic();self.check()
         if not planned.success or planned.trajectory is None: raise RuntimeError(planned.message)
-        traj=self._record_motion(planned.trajectory,stage)
+        traj=self._record_motion(planned.trajectory,stage,group)
         self.log('规划完成',f'method=opt points={len(traj.points)} '
             f'state_ms={(state_ready-started)*1000:.1f} world_ms={(world_ready-state_ready)*1000:.1f} '
             f'solve_ms={(solved-world_ready)*1000:.1f} segment_ms={(time.monotonic()-started)*1000:.1f}')
@@ -527,11 +550,156 @@ class TaskBackend:
                     if values is not None: setattr(reverse,field,values.flip(0)*sign)
                 self._return_segments[last]=reverse
         self.p.last_timing={'interpolation':time.monotonic()-started}
-        traj=self._record_motion(trajectory,stage)
+        traj=self._record_motion(trajectory,stage,task.group_name)
         self.log('插补完成',f'ik_samples={details["ik_samples"]} ik_calls={details["ik_calls"]} points={len(traj.points)} '
             f'elapsed_ms={(time.monotonic()-started)*1000:.1f} collision=off')
 
-    def _record_motion(self,trajectory,stage):
+    def merge_continuous_motions(self,group):
+        """Keep source timing; open promptly and plan a hold only if needed."""
+        started=time.monotonic();arm=GROUP_JOINTS[group]
+        merged=[];names=[];pending=self._pending_open;self._open_along={}
+        for kind,start,end in continuous_runs(self.trajectory_stages):
+            labels=self.trajectory_stages[start:end];chunk=self.trajectories[start:end]
+            contexts=list(self._segment_checks[start:end])
+            if kind=='gripper':
+                merged.extend(chunk);names.extend(labels);continue
+            label='+'.join(labels);stops=[]
+            prepick_index=labels.index('prepick')+1 if 'prepick' in labels else None
+            if pending is not None and prepick_index is not None:
+                original_arrival=sum(t.points[-1].time_from_start.sec+t.points[-1].time_from_start.nanosec*1e-9 for t in chunk[:prepick_index])
+                if pending['duration']>original_arrival+1e-8: stops=[prepick_index]
+            if len(chunk)>1:
+                trajectory,boundaries=self._blend_arm(chunk,arm,group,stops=stops,contacts=[name in ('pick','lift','place','retreat') for name in labels])
+            else:
+                trajectory=copy.deepcopy(chunk[0])
+                boundaries=np.array([0.,trajectory.points[-1].time_from_start.sec+trajectory.points[-1].time_from_start.nanosec*1e-9])
+            if pending is not None and prepick_index is not None:
+                if pending['duration']>float(boundaries[prepick_index])+1e-8 and prepick_index not in stops and len(chunk)>1:
+                    stops.append(prepick_index)
+                    trajectory,boundaries=self._blend_arm(chunk,arm,group,stops=stops,
+                        contacts=[name in ('pick','lift','place','retreat') for name in labels])
+                until=pending['duration'];arrival=float(boundaries[prepick_index]);wait=max(0.,until-arrival)
+                if wait>1e-8:
+                    trajectory=insert_stationary_hold(trajectory,arrival,wait)
+                    boundaries[prepick_index:]+=wait
+                    boundaries=np.insert(boundaries,prepick_index,arrival)
+                    hold=dict(contexts[prepick_index-1]);hold['stage']='prepick_open_wait'
+                    contexts.insert(prepick_index,hold)
+                if until>0.:
+                    trajectory=overlay_joint_motion(trajectory,pending['joint'],pending['start'],pending['target'],until)
+                    self._open_along[label]=until
+                self.log('夹爪自动张开',f'open_s={until:.3f} prepick_arrival_s={arrival:.3f} planned_wait_s={wait:.3f} feedback_wait=false')
+                pending=None
+            self._validate_merged(group,trajectory,contexts,boundaries)
+            merged.append(trajectory);names.append(label)
+        if pending is not None: raise RuntimeError('张开轨迹没有对应的预抓取阶段')
+        combined=concatenate_segments(merged);self._validated_samples(group,combined)
+        self.trajectories=merged;self.trajectory_stages=names
+        self.log('合并验收完成',f'segments={len(merged)} points={len(combined.points)} elapsed_ms={(time.monotonic()-started)*1000:.1f}')
+
+    def _dynamic_limits(self,group):
+        transition=self.p._planners[group].trajopt_solver.transition_model
+        return [x.detach().cpu().numpy().reshape(-1).clip(1e-6) for x in
+                (transition.max_velocity,transition.max_acceleration,transition.max_jerk)]
+
+    def _blend_arm(self,chunk,arm,group,stops=(),contacts=None):
+        paths=[];clocks=[];velocities=[];accelerations=[]
+        for traj in chunk:
+            index=[traj.joint_names.index(name) for name in arm]
+            paths.append(np.array([[point.positions[i] for i in index] for point in traj.points],dtype=np.float64))
+            clocks.append(np.array([point.time_from_start.sec+point.time_from_start.nanosec*1e-9 for point in traj.points]))
+            velocities.append(np.array([[point.velocities[i] if point.velocities else 0. for i in index] for point in traj.points]))
+            accelerations.append(np.array([[point.accelerations[i] if point.accelerations else 0. for i in index] for point in traj.points]))
+        # Segment messages already include trajopt_velocity_scale. Do not apply it again.
+        piece,times,boundaries=blend_through(paths,arm,self.p.interpolation_dt,self._dynamic_limits(group),1.,timings=clocks,velocities=velocities,accelerations=accelerations,stops=stops,contacts=contacts,metadata=True)
+        full_names=list(chunk[0].joint_names)
+        held=np.asarray(chunk[0].points[0].positions,dtype=np.float64)
+        arm_index=[full_names.index(name) for name in arm]
+        position=np.repeat(held.reshape(1,-1),len(piece.position),axis=0)
+        velocity=np.zeros_like(position);acceleration=np.zeros_like(position)
+        position[:,arm_index]=piece.position.detach().cpu().numpy()
+        velocity[:,arm_index]=piece.velocity.detach().cpu().numpy()
+        acceleration[:,arm_index]=piece.acceleration.detach().cpu().numpy()
+        merged=numpy_traj_to_msg(full_names,position,velocity,dt=self.p.interpolation_dt,velocity_scale=1.)
+        for point,row,t in zip(merged.points,acceleration,times):
+            point.accelerations=row.tolist();point.time_from_start=ros_duration(round(float(t)*1e9))
+        for index,boundary in enumerate(boundaries[1:-1],1):
+            nearest=int(np.argmin(np.abs(times-boundary)))
+            speed=float(np.linalg.norm(velocity[nearest,arm_index]))
+            self.log('路点通过速度',f'boundary={index} time_s={boundary:.3f} joint_speed_norm={speed:.6f}rad/s planned_stop={str(index in stops).lower()}')
+        merged.header.frame_id=self.node.base_frame
+        return merged,boundaries
+
+    def _validated_samples(self,group,trajectory):
+        """Check the exported controller curve, including close/release joins."""
+        times,q,v,a,j=sample_trajectory(trajectory)
+        columns=[trajectory.joint_names.index(name) for name in GROUP_JOINTS[group]]
+        for values,limit,order in zip((v,a,j),self._dynamic_limits(group),(1,2,3)):
+            if np.any(np.abs(values[:,columns])>limit*1.015+1e-5):
+                raise RuntimeError(f'合并轨迹超过 {order} 阶关节动态限位')
+        for joint,limit in self.p._gripper_state._velocity_limits.items():
+            if joint in trajectory.joint_names:
+                column=trajectory.joint_names.index(joint)
+                low,high=self.p._gripper_state._limits[joint]
+                if np.max(np.abs(v[:,column]))>limit*1.015 or np.min(q[:,column])<low-1e-6 or np.max(q[:,column])>high+1e-6:
+                    raise RuntimeError(f'合并轨迹夹爪 {joint} 超限')
+        return times,q
+
+    def _validate_merged(self,group,trajectory,contexts,boundaries):
+        """Recheck the actual controller spline against each original phase's scene."""
+        import torch
+        from curobo.types import JointState
+        from curobo_ros_python.planning.cartesian_interpolation import validate_path
+        from curobo._src.geom.types import SceneCfg
+        if len(contexts)!=len(boundaries)-1 or any(item is None for item in contexts):
+            raise RuntimeError('合并轨迹缺少原始阶段验收信息')
+        times,q=self._validated_samples(group,trajectory)
+        columns=[trajectory.joint_names.index(name) for name in GROUP_JOINTS[group]]
+        motion=self.p._planners[group];checker=self.p._mesh_checker
+        saved_world=motion.scene_collision_checker.scene_model
+        saved_scene=self.p._mesh_scenes[group];saved_environment=checker.environment
+        saved_payload=checker.payload
+        try:
+            for index,context in enumerate(contexts):
+                self.check()
+                mask=(times>=boundaries[index]-1e-8)&(times<=boundaries[index+1]+1e-8)
+                positions=q[mask][:,columns]
+                state=JointState.from_position(torch.as_tensor(positions,device=self.p.device,dtype=torch.float32),joint_names=GROUP_JOINTS[group])
+                values=context['joints']
+                self.p.update_gripper_state(values)
+                current,_=joint_map_to_curobo(self.p.joint_names,values,self.p.device,default_position=self.p.default_joint_position)
+                self.p._sync_locked_arm(group,current)
+                bounds=motion.kinematics.get_joint_limits().position.detach().cpu().numpy()
+                if np.any(positions<bounds[0]-1e-6) or np.any(positions>bounds[1]+1e-6):
+                    raise RuntimeError(f"{context['stage']} 合并后超过关节位置限位")
+                actual=None
+                keep_vertical=getattr(self.p,'keep_tool_z_vertical',False)
+                if context['contact'] or keep_vertical:
+                    actual=self.p.fk_tool_path(state,group+'_ee_link')
+                if keep_vertical:
+                    quaternion=actual[:,3:]
+                    z=1.-2.*(quaternion[:,1]**2+quaternion[:,2]**2)
+                    tilt=np.degrees(np.arccos(np.clip(np.abs(z),0.,1.)))
+                    self.log('工具Z竖直检查',f"source_stage={context['stage']} mean_tilt_deg={tilt.mean():.2f} max_tilt_deg={tilt.max():.2f} mode=soft yaw=free")
+                if context['contact']:
+                    validate_path(actual,context['line_start'],context['line_end'],self.p._position_tolerance,self.p._orientation_tolerance)
+                else:
+                    if checker.payload is not context['payload']: set_payload(self.p,context['payload'])
+                    motion.update_world(context['world'] if context['world'] is not None else SceneCfg())
+                    checker.environment=context['scene']
+                    if not motion._joint_traj_is_collision_free(state):
+                        raise RuntimeError(f"{context['stage']} 合并后 GPU 碰撞验收失败")
+                    for row in (positions[0],positions[-1]):
+                        keypoint=dict(values);keypoint.update(zip(GROUP_JOINTS[group],row))
+                        collision=checker.check(keypoint)
+                        if collision is not None: raise RuntimeError(f"{context['stage']} 合并后 FCL 关键点碰撞: {collision}")
+        finally:
+            motion.update_world(saved_world if saved_world is not None else SceneCfg())
+            self.p._mesh_scenes[group]=saved_scene;checker.environment=saved_environment
+            if checker.payload is not saved_payload: set_payload(self.p,saved_payload)
+            self.p.update_gripper_state(self._collision_joints())
+
+    def _record_motion(self,trajectory,stage,group):
         """Pack one stopped segment and advance the offline full joint state."""
         full=expand_joint_trajectory(trajectory,self.virtual_joints,self.joint_names)
         positions=full.position.detach().cpu().numpy().reshape(-1,len(self.joint_names))
@@ -542,24 +710,42 @@ class TaskBackend:
             acceleration=full.acceleration.detach().cpu().numpy().reshape(positions.shape)*self.node.trajopt_velocity_scale**2
             for point,row in zip(traj.points,acceleration): point.accelerations=row.tolist()
         traj.header.frame_id=self.node.base_frame
+        contact=stage in ('pick','lift','place','retreat')
+        context={'stage':stage,'contact':contact,'joints':self._collision_joints(),
+                 'world':self.p._planners[group].scene_collision_checker.scene_model,
+                 'scene':self.p._mesh_scenes[group],'payload':self.p._mesh_checker.payload}
+        if contact:
+            from curobo.types import JointState
+            first=JointState.from_position(trajectory.position.reshape(-1,trajectory.position.shape[-1])[:1],joint_names=trajectory.joint_names)
+            context['line_start']=self.p.fk_tool_path(first,group+'_ee_link')[0]
+            goal=self._target(stage).pose;v=goal.position;q=goal.orientation
+            context['line_end']=np.array([v.x,v.y,v.z,q.w,q.x,q.y,q.z])
+        self._segment_checks.append(context)
         self.trajectories.append(traj);self.trajectory_stages.append(stage)
         self.virtual_joints.update(zip(self.joint_names,traj.points[-1].positions))
         self.virtual_state=None
         return traj
 
     def gripper(self,task,position,stage):
-        self.feedback(stage,f'joint_position={position:.6f} duration_s={task.gripper_duration:.3f}')
         name=self._validate_gripper_target(task,position)
-        self._current()
-        traj=gripper_segment(self.joint_names,self.virtual_joints,name,float(position),
-                             float(task.gripper_duration),self.p.interpolation_dt)
-        traj.header.frame_id=self.node.base_frame
-        self.trajectories.append(traj);self.trajectory_stages.append(stage)
-        self.virtual_joints.update(zip(self.joint_names,traj.points[-1].positions))
-        self.last_gripper_position=float(position)
-        self.virtual_state=None
-        self.p.update_gripper_state(self.virtual_joints)
-        self.log('夹爪轨迹完成',f'points={len(traj.points)} command_sent=false')
+        initial=float(self.virtual_joints[name]);target=float(position)
+        duration=self.p._gripper_state.motion_duration(name,initial,target,self.p.interpolation_dt)
+        wait=0. if stage=='open' else self.gripper_wait_time
+        self.feedback(stage,f'joint_position={target:.6f} auto_duration_s={duration:.3f} settle_wait_s={wait:.3f} feedback_wait=false')
+        if stage=='open':
+            self._pending_open={'joint':name,'start':initial,'target':target,'duration':duration}
+            self._open_collision_joint=name
+        else:
+            duration=max(duration,self.p.interpolation_dt)
+            traj=gripper_segment(self.joint_names,self.virtual_joints,name,target,duration,self.p.interpolation_dt)
+            if wait>0.:
+                traj=insert_stationary_hold(traj,duration,wait)
+            traj.header.frame_id=self.node.base_frame
+            self._segment_checks.append(None)
+            self.trajectories.append(traj);self.trajectory_stages.append(stage)
+            self._open_collision_joint=None
+        self.virtual_joints[name]=target
+        self.last_gripper_position=target;self.virtual_state=None
         self.check()
 
     def attach(self,task):

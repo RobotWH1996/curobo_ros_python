@@ -33,6 +33,7 @@ from curobo_ros_python.planning.groups import (
     unknown_group,
 )
 from curobo_ros_python.planning.gripper import GripperStateUpdater
+from curobo_ros_python.planning.tool_z_vertical import install_vertical_cost, vertical_tool_scope
 from curobo_ros_python.planning.fixed_state import FixedJointStateUpdater
 from curobo_ros_python.planning.mesh_collision import MeshCollision, MeshCollisionChecker
 from curobo_ros_python.planning.ik_collision_filter import install_ik_filter
@@ -347,8 +348,10 @@ class CuroboPlanner:
         finetune_attempts: int = 1,
         logger=None,
         self_filter_geometry: bool = False,
+        keep_tool_z_vertical: bool = False,
     ):
         self._log = logger
+        self.keep_tool_z_vertical = bool(keep_tool_z_vertical)
         seeds = int(num_trajopt_seeds)
         iters = int(trajopt_num_iters)
         finetune = int(finetune_attempts)
@@ -531,6 +534,7 @@ class CuroboPlanner:
             trajopt_num_iters=self._iters,
         )
         motion = MotionPlanner(cfg)
+        install_vertical_cost(motion)
         motion.waypoint_joint_tolerance = self._joint_tol
         return motion
 
@@ -1114,20 +1118,21 @@ class CuroboPlanner:
                 current_fk = self.fk_tool_poses(current)
             goal, idle_joints = self._goal_for_ee_poses(current, pose_by_ee, current_fk=current_fk)
             goals.append(goal)
-        if len(goals) == 1:
-            result = motion.plan_pose(
-                goals[0],
-                active,
-                max_attempts=max_attempts,
-                finetune_attempts=self._finetune_attempts,
-            )
-        else:
-            result = motion.plan_cartesian_waypoints(
-                goals,
-                active,
-                max_attempts=max_attempts,
-                finetune_attempts=self._finetune_attempts,
-            )
+        with vertical_tool_scope(motion,self.keep_tool_z_vertical,tuple(pose_by_ee),goal_poses=goals[-1]):
+            if len(goals) == 1:
+                result = motion.plan_pose(
+                    goals[0],
+                    active,
+                    max_attempts=max_attempts,
+                    finetune_attempts=self._finetune_attempts,
+                )
+            else:
+                result = motion.plan_cartesian_waypoints(
+                    goals,
+                    active,
+                    max_attempts=max_attempts,
+                    finetune_attempts=self._finetune_attempts,
+                )
         self.last_timing = dict(getattr(motion, "last_timing", {}) or {})
         if len(goals) == 1:
             return self._from_single_result(result, current, idle_joints)
@@ -1159,20 +1164,22 @@ class CuroboPlanner:
                 collision_hits.append(collision_error)
         if collision_hits:
             return self._fail("规划失败: " + "；".join(collision_hits))
-        if len(goals) == 1:
-            result = motion.plan_cspace(
-                goals[0],
-                active,
-                max_attempts=max_attempts,
-                finetune_attempts=self._finetune_attempts,
-            )
-        else:
-            result = motion.plan_joint_waypoints(
-                list(goals),
-                active,
-                max_attempts=max_attempts,
-                finetune_attempts=self._finetune_attempts,
-            )
+        frames=both_arm_ee_links() if group_name=='both_arms' else (resolve_ee_link(group_name,'')[0],)
+        with vertical_tool_scope(motion,self.keep_tool_z_vertical,frames,goal_state=goals[-1]):
+            if len(goals) == 1:
+                result = motion.plan_cspace(
+                    goals[0],
+                    active,
+                    max_attempts=max_attempts,
+                    finetune_attempts=self._finetune_attempts,
+                )
+            else:
+                result = motion.plan_joint_waypoints(
+                    list(goals),
+                    active,
+                    max_attempts=max_attempts,
+                    finetune_attempts=self._finetune_attempts,
+                )
         self.last_timing = dict(getattr(motion, "last_timing", {}) or {})
         if len(goals) == 1:
             return self._from_single_result(result, current, hold_joints)

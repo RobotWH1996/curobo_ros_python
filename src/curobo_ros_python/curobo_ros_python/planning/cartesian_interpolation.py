@@ -1,11 +1,16 @@
 """Collision-unchecked Cartesian segments with continuous IK and bounded timing."""
 from dataclasses import replace
 import math
+import time
+from typing import Any, Callable, Optional, Sequence
 import numpy as np
 import torch
 from curobo.types import JointState, Pose, GoalToolPose
 from curobo._src.solver.seed_ik.seed_ik_solver import SeedIKSolver
 from curobo_ros_python.planning.offline_trajectory import stopped_segments
+
+
+_IK_BATCHES = (33, 65, 129, 257, 513)
 
 
 def sample_poses(start, end, fractions):
@@ -58,6 +63,51 @@ def kinematic_solver(motion,key,num_seeds=1):
     return instance
 
 
+
+def prewarm_interpolation_ik(
+    planner: Any,
+    groups: Sequence[str],
+    sample_counts: Sequence[int],
+    progress: Optional[Callable[[str, int, float], None]] = None,
+) -> None:
+    """Capture the same endpoint/batch IK caches used by Cartesian segments.
+
+    Repeated FK poses from the default state need no sensor data or scene checks.
+    Only IK buffers are warmed; no trajectory is published or executed.
+    """
+    if not groups or any(group not in ("left_arm", "right_arm") for group in groups):
+        raise ValueError("pick_place_ik_prewarm_modes 必须包含 left_arm / right_arm")
+    if not sample_counts or any(type(count) is not int or count not in _IK_BATCHES for count in sample_counts):
+        raise ValueError(f"pick_place_ik_prewarm_samples 必须选自 {_IK_BATCHES}")
+    for group in dict.fromkeys(groups):
+        group_started = time.perf_counter()
+        motion = planner._planners[group]
+        endpoint = kinematic_solver(motion, "endpoint")
+        state = endpoint.kinematics.default_joint_state
+        tool_poses = endpoint.kinematics.compute_kinematics(state).tool_poses
+        for count in [1, *dict.fromkeys(sample_counts)]:
+            started = group_started if count == 1 else time.perf_counter()
+            solver = endpoint if count == 1 else kinematic_solver(motion, count)
+            poses = {}
+            for frame in motion.tool_frames:
+                pose = tool_poses.get_link_pose(frame)
+                poses[frame] = Pose(
+                    position=pose.position.reshape(1, 3).repeat(count, 1),
+                    quaternion=pose.quaternion.reshape(1, 4).repeat(count, 1),
+                    normalize_rotation=False,
+                )
+            goal = GoalToolPose.from_poses(poses, ordered_tool_frames=motion.tool_frames, num_goalset=1)
+            seed = state.position.reshape(1, 1, -1).repeat(count, 1, 1)
+            solve = solver.solve_single if count == 1 else solver.solve_batch
+            result = solve(goal, seed_config=seed, return_seeds=1)
+            if not bool(result.success.all()):
+                raise RuntimeError(f"{group} 插补 IK 预热校验失败，samples={count}")
+            if state.position.is_cuda:
+                torch.cuda.synchronize(state.position.device)
+            if progress is not None:
+                progress(group, count, (time.perf_counter() - started) * 1000.0)
+
+
 def refine_ik(planner,motion,goal,previous):
     """Pose-only fallback for LM singularities; scene is empty and self checks off."""
     from curobo.inverse_kinematics import InverseKinematics,InverseKinematicsCfg
@@ -105,7 +155,7 @@ def interpolate_cartesian(planner,motion,current,target,tool,dt,velocity_scale,c
         refined=refine_ik(planner,motion,endpoint_goal,first)
         if refined is not None:endpoint_q=refined.reshape(1,-1)
     if endpoint_q is not None:
-        bucket=next(n for n in (33,65,129,257,513) if n>=count)
+        bucket=next(n for n in _IK_BATCHES if n>=count)
         batch_solver=kinematic_solver(motion,bucket);fractions=np.linspace(0.,1.,bucket)
         desired=sample_poses(start,end,fractions);pose_map={}
         for frame in motion.tool_frames:

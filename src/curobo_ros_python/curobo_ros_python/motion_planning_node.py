@@ -60,6 +60,9 @@ _PARAM_DEFAULTS: Dict[str, Any] = {
     "robot": "lycus.yml",
     "scene_model": "",
     "warmup_iterations": 3,
+    "pick_place_ik_prewarm": True,
+    "pick_place_ik_prewarm_modes": ["left_arm", "right_arm"],
+    "pick_place_ik_prewarm_samples": [33, 65, 129],
     "use_cuda_graph": True,
     "interpolation_dt": 0.02,
     "trajopt_num_seeds": 2,
@@ -241,7 +244,9 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
             finetune_attempts=int(self._p("trajopt_finetune_attempts")),
             logger=self.get_logger(),
             self_filter_geometry=str(self._p('self_filter_mode')) != 'off',
+            keep_tool_z_vertical=bool(self._p('keep_tool_z_vertical')),
         )
+        self._prewarm_interpolation_ik()
         self.executor_helper = None
         if self.execute_trajectory:
             self.executor_helper = TrajectoryExecutor(
@@ -350,6 +355,27 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
             self.get_logger().info("基础节点已启动，等待 MPC 预热完成...")
         else:
             self._log_initialization_complete()
+
+    def _prewarm_interpolation_ik(self) -> None:
+        if not bool(self._p("pick_place_ik_prewarm")):
+            self.get_logger().info("[插补预热] enabled=false，新规格首次使用时初始化")
+            return
+        from curobo_ros_python.planning.cartesian_interpolation import prewarm_interpolation_ik
+
+        modes = list(self._p("pick_place_ik_prewarm_modes"))
+        samples = list(self._p("pick_place_ik_prewarm_samples"))
+        self.get_logger().info(f"[插补预热] event=开始 groups={modes} samples={samples}")
+        started = time.perf_counter()
+
+        def progress(group: str, count: int, elapsed_ms: float) -> None:
+            self.get_logger().info(
+                f"[插补预热] group={group} samples={count} ready=true elapsed_ms={elapsed_ms:.1f}"
+            )
+
+        prewarm_interpolation_ik(self.planner, modes, samples, progress)
+        self.get_logger().info(
+            f"[插补预热] event=完成 ready=true elapsed_ms={(time.perf_counter()-started)*1000:.1f}"
+        )
 
     def _log_initialization_complete(self) -> None:
         if self._initialization_logged:
@@ -958,6 +984,7 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
         self.get_logger().info(f"{kind} [{group_name}] 分段(ms): {timer.summary()}")
 
     def _current_curobo_state(self):
+        self.planner.keep_tool_z_vertical=bool(self._p('keep_tool_z_vertical'))
         joint_map = dict(self._joint_map)
         self.planner.update_gripper_state(joint_map)
         current, missing = joint_map_to_curobo(

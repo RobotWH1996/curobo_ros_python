@@ -18,7 +18,7 @@ if _config_files:
 setup(
     name=package_name,
     version="0.1.0",
-    packages=find_packages(exclude=["test"]),
+    packages=find_packages(),
     data_files=_data_files,
     install_requires=["setuptools", "python-fcl>=0.7.0.11", "trimesh>=4.0", "rtree>=1.0"],
     zip_safe=True,
@@ -26,7 +26,6 @@ setup(
     maintainer_email="victor@todo.todo",
     description="cuRobo ROS 2 motion planning services (robot selected by the robot YAML parameter)",
     license="Apache-2.0",
-    tests_require=["pytest"],
     entry_points={
         "console_scripts": [
             "curobo_motion_planning_node = curobo_ros_python.main:main",

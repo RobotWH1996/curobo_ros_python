@@ -78,7 +78,6 @@ def _parse_args():
     parser.add_argument("--lift-distance", type=float, default=0.10, help="抬升距离，沿 base +Z（米）")
     parser.add_argument("--open-position", type=float, default=0.0, help="URDF 夹爪关节位置，Lycus 0m 全开")
     parser.add_argument("--close-position", type=float, default=-0.042, help="URDF 夹爪关节位置，Lycus -0.042m 全闭")
-    parser.add_argument("--gripper-duration", type=float, default=1.0, help="每次开/闭合插补时长，秒")
     parser.add_argument("--timeout", type=float, default=5.0, help="等第一帧和 Action 服务器的秒数")
     parser.add_argument("--task-timeout", type=float, default=180.0, help="抓取任务总超时（秒）")
     parser.add_argument("--output", help="保存完整本体+夹爪轨迹及阶段元数据 JSON")
@@ -306,7 +305,6 @@ class Picker(Node):
         task.object_size.x, task.object_size.y, task.object_size.z = size
         task.open_position = float(args.open_position)
         task.close_position = float(args.close_position)
-        task.gripper_duration = float(args.gripper_duration)
         return goal
 
     def send(self) -> int:

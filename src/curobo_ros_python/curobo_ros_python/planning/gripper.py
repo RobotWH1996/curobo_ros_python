@@ -48,6 +48,7 @@ class GripperStateUpdater:
         joints = {j.get("name"): j for j in ET.parse(urdf_path).getroot().findall("joint")}
         self.joint_names = tuple(name for name in GRIPPER_JOINTS if name in joints)
         self._limits = {}
+        self._velocity_limits = {}
         self._fingers = []
         self._bindings = {}
         self._model_signature = None
@@ -57,6 +58,10 @@ class GripperStateUpdater:
             if limit is None:
                 raise ValueError(f"夹爪 {name} 缺少 URDF 限位")
             self._limits[name] = (float(limit.get("lower")), float(limit.get("upper")))
+            speed = float(limit.get("velocity", "nan"))
+            if not math.isfinite(speed) or speed <= 0:
+                raise ValueError(f"夹爪 {name} 缺少有效的 URDF 速度限位")
+            self._velocity_limits[name] = speed
         for name, joint in joints.items():
             mimic = joint.find("mimic")
             source = name if name in self.joint_names else (None if mimic is None else mimic.get("joint"))
@@ -78,6 +83,17 @@ class GripperStateUpdater:
                 1.0 if mimic is None else float(mimic.get("multiplier", "1")),
                 0.0 if mimic is None else float(mimic.get("offset", "0")),
             ))
+
+    def motion_duration(self, name, start, target, dt):
+        """RG75-300: full model stroke corresponds to the nominal 0.55 s cycle.
+
+        Scale travel in normalized model coordinates, not 75 mm per finger.
+        URDF velocity remains an independent upper bound on the quintic profile.
+        """
+        lower,upper=self._limits[name]
+        delta=abs(float(target)-float(start))
+        if delta<1e-8: return 0.
+        return max(float(dt),.55*delta/(upper-lower),1.875*delta/self._velocity_limits[name]*1.01)
 
     @classmethod
     def from_robot(cls, robot: str) -> GripperStateUpdater:

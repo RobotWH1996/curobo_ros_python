@@ -4,18 +4,19 @@ set -eo pipefail
 
 usage() {
     cat <<'EOF'
-用法：./scripts/call_pick_place.sh pick|place|pick_place [客户端参数]
+用法：./src/curobo_ros_python/scripts/call_pick_place.sh pick|place|pick_place [客户端参数]
 
 示例：
-  ./scripts/call_pick_place.sh pick --dry-run
-  ./scripts/call_pick_place.sh pick --label 11 --track-id 2 --dry-run
-  ./scripts/call_pick_place.sh pick --output /tmp/pick_result.json
-  ./scripts/call_pick_place.sh place --output /tmp/place_result.json
-  ./scripts/call_pick_place.sh pick_place --output /tmp/pick_place_result.json
-  ./scripts/call_pick_place.sh pick_place --goal-file /path/to/my_goal.yaml
+  ./src/curobo_ros_python/scripts/call_pick_place.sh pick --dry-run
+  ./src/curobo_ros_python/scripts/call_pick_place.sh pick --label 11 --track-id 2 --dry-run
+  ./src/curobo_ros_python/scripts/call_pick_place.sh pick --output /tmp/pick_result.json
+  ./src/curobo_ros_python/scripts/call_pick_place.sh place --output /tmp/place_result.json
+  ./src/curobo_ros_python/scripts/call_pick_place.sh pick_place --output /tmp/pick_place_result.json
+  ./src/curobo_ros_python/scripts/call_pick_place.sh pick_place --goal-file /path/to/my_goal.yaml
 
-默认配置：src/curobo_ros_python/config/pick_place_demo.yaml
+默认配置：src/curobo_ros_python/config/pick_place.yaml
 一份配置包含 pick/place；调用单个接口时自动提取对应任务。
+pick / pick_place 只从感知话题覆盖抓取 tool_pose，预抓取、抬升、工件尺寸和夹爪仍用该文件。
 也支持独立请求格式 {task: ..., timeout: ...}，JSON/YAML 均可。
 默认 pick/pick_place 从 /obj_poses 读取本次目标的位置和姿态，默认 label=11（ROD），
 可用 --label、--track-id、--topic 选择目标；未指定 ID 时选最高置信度。
@@ -37,11 +38,14 @@ case "${1:-}" in
     *) usage >&2; exit 2 ;;
 esac
 
-repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+while [[ "$repo_root" != "/" && ! -f "$repo_root/install/setup.bash" ]]; do
+    repo_root="$(dirname -- "$repo_root")"
+done
 ros_setup="/opt/ros/${ROS_DISTRO:-humble}/setup.bash"
 workspace_setup="$repo_root/install/setup.bash"
 if [[ ! -f "$ros_setup" || ! -f "$workspace_setup" ]]; then
-    echo "找不到 ROS/工程环境，请先构建 $repo_root 并检查 ROS_DISTRO。" >&2
+    echo "找不到 ROS/工程环境，请先构建工作空间并检查 ROS_DISTRO。" >&2
     exit 1
 fi
 source "$ros_setup"
@@ -54,4 +58,4 @@ fi
 printf 'Action: /%s | ROS_DOMAIN_ID: %s\n' "$action" "${ROS_DOMAIN_ID:-0}" >&2
 exec "$python_bin" "$repo_root/src/curobo_ros_python/scripts/pick_place_client.py" \
     --action "$action" \
-    --goal-file "$repo_root/src/curobo_ros_python/config/pick_place_demo.yaml" "$@"
+    --goal-file "$repo_root/src/curobo_ros_python/config/pick_place.yaml" "$@"

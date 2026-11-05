@@ -54,7 +54,7 @@ ros2 launch lycus_moveit_config demo.launch.py
 
 ## 调用与导出
 
-完整例子在 `src/curobo_ros_python/config/pick_place_example.yaml`。PickPlace 顶层用 pick/place，独立 Action 顶层用 task。调用脚本从 YAML 设置字段。
+完整例子在 `src/curobo_ros_python/config/pick_place.yaml`。PickPlace 顶层用 pick/place，独立 Action 顶层用 task。调用脚本从 YAML 设置字段。
 
 ```bash
 python3 src/curobo_ros_python/scripts/pick_place_client.py \

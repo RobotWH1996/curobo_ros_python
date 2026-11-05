@@ -37,3 +37,10 @@ compile_commands.json
 *.swo
 *~
 .DS_Store
+# Non-deployment artifacts (keep outside this source tree)
+output/
+benchmarks/
+test/
+tests/
+*.FCStd
+*.FCStd1

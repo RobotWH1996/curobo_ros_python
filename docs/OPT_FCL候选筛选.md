@@ -14,11 +14,3 @@
 在 cuRobo 使用的 Python 环境安装依赖：`python -m pip install -r requirements-fcl.txt`。缺少 FCL、几何解析失败或不支持的环境会报错，不会静默放行。首次加载完整 Lycus 网格 BVH 在本机实测约 15 秒，后续复用。
 
 这里是离散目标状态的三角形表面相交筛选，不认证整条路径、连续碰撞或封闭网格完全包含关系。自碰撞忽略表仍需符合实际机械结构。
-
-CPU 回归测试：`PYTHONPATH=src/curobo_ros_python python -m unittest discover -s src/curobo_ros_python/test -p test_mesh_candidate_filter.py -v`。
-
-真实 `ai` 模型离线集成脚本：`benchmarks/fcl_full_20261030/validate_candidate_integration.py`。它使用已保存的合成场景和关节回放，验证清空场景下的候选能生成轨迹，以及实际环境 mesh 碰撞导致全部候选被剔除且不会调用 TrajOpt；不发布控制命令。
-
-2026-10-30 验证结果：7 项新增 CPU 回归和 4 项原有夹爪回归全部通过。真实模型在合成桌面/墙面场景下 2 个候选均通过并生成 21 点轨迹；加入阻挡 mesh 后，2 个候选均因环境碰撞被剔除，测试确认没有调用 TrajOpt。结果见 `benchmarks/fcl_full_20261030/candidate_integration_result.json`。
-
-实现已同步到 `ai:/home/ai/wh/curobo_ros_python/`，原有远程腕部检查和其他用户改动保留。覆盖前备份在 `ai:/tmp/fcl_candidate_backup_20261030_7xy9yy1r/`。本次未重启运行中的 ROS 节点；新代码在进程重新加载对应源码后生效。

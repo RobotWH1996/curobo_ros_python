@@ -4,9 +4,9 @@ ROS 2 Humble 双臂规划节点，支持 Lycus（`lycus.yml`）和 K100（`k100.
 
 ## OPT 抓取与放置（Pick / Place / PickPlace）
 
-三个 Action 的外段复用现有 `plan_joint` / `plan_pose`，中段用连续 IK 生成笛卡尔插补，按抓放阶段规划，并在返回前拼接好**完整本体关节 + 左右夹爪关节**的 `JointTrajectory`。手臂仍按原来的规划组优化，夹爪不加入 OPT 自由度；张开、闭合和释放是独立插补段，手臂在这些段保持不动。手臂运动段保持当前计划夹爪位置。
+三个 Action 的外段复用现有 `plan_joint` / `plan_pose`，中段用连续 IK 生成笛卡尔插补，按抓放阶段规划，并在返回前拼接好**完整本体关节 + 左右夹爪关节**的 `JointTrajectory`。手臂仍按原来的规划组优化，夹爪不加入 OPT 自由度；抓取前的张开叠加到接近运动中，按夹爪能力尽快张开，提前完成后保持；接近路程不足时，在 prepick 计划停留到张开完成。抓取闭合和放置释放期间保持手臂静止。普通路点、预置点、抬升点、撤退点和中间 end 不再逐段停顿，整次任务起终点仍平稳启停。
 
-三个接口先完成整次任务的规划与拼接，再沿用节点启动配置决定是否执行：debug.yaml 的 execute_trajectory=true，规划成功后分段下发仿真控制器并等待标准 Action 结果；deploy.yaml 为 false，只发布和返回轨迹，供实机转接脚本使用。请求中不再设置 execute。夹爪使用通用关节轨迹接口，不依赖设备专用消息或 SDK。
+三个接口先完成整次任务的规划与拼接，再沿用节点启动配置决定是否执行：debug.yaml 的 execute_trajectory=true，规划成功后将整条手臂与夹爪轨迹异步提交仿真控制器，不等待执行结果；deploy.yaml 为 false，只发布和返回轨迹，供实机转接脚本使用。请求中不再设置 execute。夹爪使用通用关节轨迹接口，不依赖设备专用消息或 SDK。
 
 ### 接口、阶段与完整轨迹
 
@@ -19,7 +19,7 @@ ROS 2 Humble 双臂规划节点，支持 Lycus（`lycus.yml`）和 K100（`k100.
 抓放只支持 `left_arm` 或 `right_arm` 单臂 OPT，使用 mesh 点云碰撞。左/右工具系分别为 `left_arm_ee_link` / `right_arm_ee_link`。原有单臂 7 关节、双臂 14 关节优化，多关节角目标、多笛卡尔目标、混合路点、IK、MPC、本体点云过滤均保留。
 
 ```text
-Pick：张开插补 → 混合路点 → prepick → pick → 闭合插补 → lift → 启用工件碰撞 → end_pose
+Pick：接近时同步张开〔混合路点 → prepick〕→ pick〔停顿闭合〕→ lift → 启用工件碰撞 → end_pose
 Place：携物混合路点 → preplace → place → 张开插补 → 解除附着 → retreat → end_pose
 PickPlace：完整 Pick → 完整 Place（包括各自可选的 end_pose）
 ```
@@ -33,12 +33,12 @@ PickPlace：完整 Pick → 完整 Place（包括各自可选的 end_pose）
 | 结果 | 含义 |
 | --- | --- |
 | `success`、`stage`、`message` | 当前模式任务是否成功、结束/失败阶段及原因；不表示实际夹到物体 |
-| `execution_requested`、`execution_completed` | 是否按节点配置请求控制器执行、全部阶段是否执行成功；deploy 下两者均为 false |
+| `execution_requested`、`execution_completed` | 前者表示 debug 请求下发；规划侧不等待执行，后者保持 false，不能据此判断实机完成。deploy 下两者均为 false |
 | `trajectory` | 返回前完成拼接的整条轨迹，统一关节顺序、全任务时间轴 |
 | `trajectories` | 各阶段的完整关节轨迹，每段从自己的局部时间开始 |
-| `trajectory_stages` | 与 trajectories 一一对应的阶段名，包含夹爪开/闭段 |
+| `trajectory_stages` | 与 trajectories 一一对应；连续运动段用 + 连接原阶段名，close/release 单独保留 |
 
-整条轨迹已经包含夹爪位置，不需要使用方再按阶段猜开合时刻。两种模式均向 `/curobo/planned_trajectory` 发布完整轨迹。debug 在所有段规划成功后，依次下发手臂段或夹爪段，等当前控制器成功才下发下一段；切换和反馈会带来段间开销，完整轨迹时间轴为计划时长。deploy 不调用控制器。失败/取消可能保留已规划轨迹，必须检查 success、execution_completed 和阶段；取消执行中的任务会取消当前控制器目标并停止后续段。
+整条轨迹已经包含夹爪位置和必要停留，不需要控制方再猜开合时刻。debug 将完整时间轴拆为手臂、夹爪两组关节列，一次异步提交给控制适配器；deploy 只发布/返回。规划 Action 的 success 表示轨迹规划通过，execution_completed 保持 false，执行状态、反馈确认、超时和取消由控制层处理。取消尚未完成的规划会停止后续规划；已提交轨迹由控制层取消。
 
 ### PickTask 与 PlaceTask 参数
 
@@ -56,9 +56,11 @@ PickPlace：完整 Pick → 完整 Place（包括各自可选的 end_pose）
 | `object_size` | 可省略 | 可省略 | 工件包围盒三边，米；全零读取节点默认，显式值须三个有限正数 |
 | `open_position` | 0.0 | 0.0 | 夹爪 URDF 关节位置。Lycus 单位米，0 全开 |
 | `close_position` | -0.042 | — | Pick 闭合的计划关节位置；Lycus -0.042 m 全闭，按工件尺寸调整 |
-| `gripper_duration` | 1.0 s | 1.0 s | Pick 每次张开/闭合、Place 释放的插补时长，必须为有限正数 |
 
-夹爪值直接使用 URDF 关节单位，不是百分比、归一化行程或力控制；程序按模型关节限位校验。Lycus 的范围为 `[-0.042, 0.0]` m。`gripper_duration` 只决定计划插补时长，不是驱动速度或等待反馈超时。离线规划不会自动推断工件接触后的夹持位置，close_position 应填写预计夹持位置。
+夹爪值直接使用 URDF 关节单位，Lycus 范围为 `[-0.042, 0.0]` m。无需输入开闭时长或速度。RG75-300 以满行程约 0.55 s 为标称能力，按模型行程比例和 URDF 速度约束生成平滑开合轨迹；75 mm 不直接作为单指关节行程。夹爪起步即张开，提前完成则保持，路程过短则在 prepick 插入计划停留。闭合/释放时间也自动规划。旧消息中的 gripper_duration 仅保留兼容，不再读取；YAML 和客户端已移除该输入。close_position 仍由调用方给出预计夹持位置。
+
+`config/debug.yaml` / `config/deploy.yaml` 的节点参数 `gripper_wait_time: 1.0` 控制额外稳定等待（秒），供 Pick、Place、PickPlace 共用。抓取点先完成闭合，再保持手臂和夹爪静止该时长后抬升；放置点先完成张开，再保持该时长后撤退。它不包含夹爪开合时间，不用于抓取前提前张开，也不轮询反馈。`0.0` 关闭额外等待；必须为有限非负数。每次规划开始时固定本次使用的值。修改节点 YAML 后重启生效，也可用 `ros2 param set /curobo_motion_planning_node gripper_wait_time 0.5` 修改后续任务的等待。此参数不改变 Action 消息格式。
+
 
 单独 Place 用自己的 `object_size`，工件相对工具由 `place_pose` 反推。它从初始 `/joint_states` 对应工具位姿建立附着模型，夹爪起始开度也来自该反馈，不依赖上一次 Pick。PickPlace 使用本次 Pick 的几何。任务结束恢复本次临时附着、放置场景和真实反馈状态，不跨请求保留携物记录。
 
@@ -91,16 +93,16 @@ end_pose:
 
 | 区间 | 规划方法 | 碰撞策略 |
 | --- | --- | --- |
-| Pick 起点、路点 → prepick | OPT | GPU 正常避障，FCL 检查关键点 |
+| Pick 起点、路点 → prepick | OPT | 按当前手臂夹爪全开（URDF upper）做 GPU 避障与 FCL 关键点检查 |
 | prepick → pick → lift | 平移直线 + 姿态 SLERP + 连续 IK | 不检查环境、自碰撞或 FCL；保留 IK、关节位置/速度/加速度/jerk 限位 |
 | lift 后 → Pick end | OPT | 恢复正常碰撞，附着工件随工具运动 |
 | Place 携物起点、路点 → preplace | OPT | 正常检查机器人和附着工件 |
 | preplace → place → retreat | 平移直线 + 姿态 SLERP + 连续 IK | 不检查环境、自碰撞或 FCL，包括工件 |
 | retreat 后 → Place end | OPT | 恢复正常碰撞，放下的工件作为静态障碍 |
 
-中段不调用 OPT。批量 IK 使用缓存求解器，局部失败时用连续求解和步长细分；不能保持连续到达时明确失败，不跳过路点。预置点与抬升/撤退位姿相同时，复用同一路径反向返回，避免重复 IK。轨迹重定时后再用 FK 检查直线、姿态及终点误差。夹爪开合段保持手臂不动，各阶段连接处速度和加速度归零；没有跨越抓放停顿做平滑。
+中段不调用 OPT。批量 IK 使用缓存求解器，局部失败时用连续求解和步长细分；不能保持连续到达时明确失败，不跳过路点。预置点与抬升/撤退位姿相同时，复用同一路径反向返回，避免重复 IK。轨迹重定时后再用 FK 检查直线、姿态及终点误差。只有闭合/释放段保持手臂不动。合并保留原始 OPT/插补时间轴，保留正常巡航段的时序；根据两侧实际运动速度识别衔接处的减速/静止尾部，局部压缩并平滑通过，动态超限时才局部减速；保留各阶段准确边界；随后按控制器的五次插值加密采样，复查位置/速度/加速度/jerk 限位。普通阶段恢复其原点云场景、夹爪开度和携物模型做 GPU 路径及 FCL 关键点检查；免碰撞接触阶段仍验收 FK 直线、姿态和终点。合并验收失败时不发布成功轨迹、不下发控制器。
 
-中段免碰撞适用于调用方已确认安全的接触区间；外段不会因中段失败而自动关闭碰撞。工件使用包围盒/球簇，附着后按 OBB 对携物点云去重。
+全开碰撞模型是抓取前整段的规划假设，不覆盖从闭合到张开的动态扫掠体积；输出夹爪仍从实际反馈开度变化。接近路程不足时，prepick 的停留由规划器提前写入轨迹，不轮询夹爪反馈。中段免碰撞适用于调用方已确认安全的接触区间；外段不会因中段失败而自动关闭碰撞。工件使用包围盒/球簇，附着后按 OBB 对携物点云去重。
 
 本体过滤按 left_arm/right_arm/both_arms 处理对应手臂。`self_filter_mode`：off 关闭，observe 只分类和可视化，apply 删除本体候选后参与规划。debug/deploy 配置当前均为 apply。点云若有单个整数 `label` 字段，正标签点作为感知工件保留，不因本体余量被删；没有标签时仍执行原来的几何过滤。过滤失败保留整帧，并记录原因。详情见 [本体点云过滤](docs/本体点云过滤.md)。
 
@@ -116,7 +118,7 @@ OPT → 完整 JointTrajectory → debug：分段执行器 → 仿真控制器
 
 `/joint_states` 是实际状态输入，不用命令值冒充反馈。仿真由 Lycus 的 ros2_control 驱动本体和夹爪，一个 joint_state_broadcaster 统一发布实际独立关节；实机由现有本体/夹爪 SDK 适配脚本统一打包相同消息。规划侧只认识关节名和 JointTrajectory，不区分底层设备。RViz 通过 `/joint_states → robot_state_publisher → TF` 显示，进程可选，不参与状态刷新。
 
-规划程序不创建设备专用话题或加载设备消息包，夹爪不加入手臂规划组。debug 复用普通 OPT 的 TrajectoryExecutor：手臂段发手臂控制器，开合段发独立夹爪控制器。执行只等待标准轨迹 Action 结果，不进行设备专用的物体夹持检测。
+规划程序不创建设备专用话题或加载设备消息包，夹爪不加入手臂规划组。debug 通过 TrajectoryExecutor 控制适配器将完整手臂、夹爪时间轴一次异步提交；规划器不等待执行反馈，不进行设备专用物体夹持检测。
 
 Lycus 无界面模拟可运行 `ros2 launch lycus_moveit_config sdk_sim.launch.py`（默认发布 TF，可加 `publish_tf:=false`）；原 `demo.launch.py` 继续带 MoveIt/RViz。左右夹爪采用 `control_msgs/action/FollowJointTrajectory`，地址 `/left_gripper_controller/follow_joint_trajectory`、`/right_gripper_controller/follow_joint_trajectory`，各自只接收同侧实际夹爪关节，位置单位米，按轨迹时间插补。
 
@@ -131,7 +133,7 @@ source install/setup.bash
 ros2 launch curobo_ros_python curobo_motion_planning.launch.py
 ```
 
-接口修改后调用方须重新编译/source 并重启旧规划进程；Lycus 控制器配置也需重新构建并在下次仿真启动时加载。debug 启动默认执行，deploy 启动默认只输出；沿用原 execute_trajectory 配置，不新增任务执行开关。可编辑模板见 [pick_place_example.yaml](src/curobo_ros_python/config/pick_place_example.yaml)，填写实测坐标和尺寸后调用：
+接口修改后调用方须重新编译/source 并重启旧规划进程；Lycus 控制器配置也需重新构建并在下次仿真启动时加载。debug 启动默认执行，deploy 启动默认只输出；沿用原 execute_trajectory 配置，不新增任务执行开关。可编辑模板见 [pick_place.yaml](src/curobo_ros_python/config/pick_place.yaml)，填写实测坐标和尺寸后调用：
 
 ```bash
 python3 src/curobo_ros_python/scripts/pick_place_client.py \
@@ -160,7 +162,7 @@ python3 src/curobo_ros_python/scripts/pick_place_client.py \
   --action place --goal-file /tmp/place_goal.yaml --output /tmp/place_plan.json
 ```
 
-客户端打印完整关节名、总点数、时长与阶段名。`--output` 保存 `curobo_task_v2` JSON，含 Action Result 的完整轨迹、关节单位/时间轴及 execution_requested / execution_completed；保存文件本身不产生额外执行。`obj_pose_to_pick.py` 同样支持 `--output`，从检测工件位姿换算工具目标。它的 `--open-position/--close-position` 使用米，`--gripper-duration` 使用秒。
+客户端打印完整关节名、总点数、时长与阶段名。`--output` 保存 `curobo_task_v2` JSON，含 Action Result 的完整轨迹、关节单位/时间轴及 execution_requested / execution_completed；保存文件本身不产生额外执行。`obj_pose_to_pick.py` 同样支持 `--output`，从检测工件位姿换算工具目标。它的 `--open-position/--close-position` 使用米，开闭时间由规划自动生成。
 
 | 节点配置 | 默认 | 用途 |
 | --- | --- | --- |
@@ -183,28 +185,17 @@ workspace/
   Lycus_ros/             # 机器人驱动、控制器和描述（按部署需要）
 ```
 
-前提是 NVIDIA GPU、可工作的 CUDA/Torch、ROS 2 Humble，以及 `../curobo/.venv/bin/python` 能导入 cuRobo。安装脚本复用该环境，不负责安装驱动、Torch 或 cuRobo 本体。
+前提是 NVIDIA GPU、可工作的 CUDA/Torch、ROS 2 Humble，以及 `../curobo/.venv/bin/python` 能导入 cuRobo。本仓库不安装驱动、Torch 或 cuRobo 本体。
 
-在本仓库根目录执行：
+OPT 必需依赖为 `python-fcl==0.7.0.11`、`trimesh>=4.0`，见 `requirements-fcl.txt`。用 cuRobo 的 Python 安装：
 
 ```bash
-# 首次安装：ROS 系统依赖、FCL Python 依赖、构建所有接口及节点包
-bash scripts/setup_environment.sh --system-deps
-
-# 已安装系统依赖：只补 Python 依赖并构建
-bash scripts/setup_environment.sh
-
-# 只检查，既不安装也不构建
-bash scripts/setup_environment.sh --check
+../curobo/.venv/bin/python -m pip install -r requirements-fcl.txt
 ```
 
-`CUROBO_PYTHON=/absolute/path/bin/python` 可指定 Python；`ROS_SETUP=/opt/ros/humble/setup.bash` 可指定 ROS 环境。Python 依赖安装优先使用目标环境的 pip，没有 pip 时尝试 `uv pip --python`。二者都没有时脚本会给出错误，不自动更换 Python 或安装 Torch。
+Jetson 若已配置 `libcusolver_batched_stub.so`，launch 会使用现有兼容库。遇到 Torch/cuSOLVER 导入错误，先修复 cuRobo 环境。
 
-OPT 必需依赖为 `python-fcl==0.7.0.11`、`trimesh>=4.0`，见 `requirements-fcl.txt`。脚本会检查 CUDA、ROS 导入、Lycus URDF/配置、FCL 独立忽略表及相机连杆名称。
-
-Jetson 若已配置 `libcusolver_batched_stub.so`，脚本与 launch 会使用现有兼容库；脚本不生成兼容库。遇到 Torch/cuSOLVER 导入错误，先修复 cuRobo 环境。
-
-手动构建：
+构建：
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -302,8 +293,8 @@ ros2 launch curobo_ros_python curobo_motion_planning_deploy.launch.py log_level:
 - `method=cartesian_interpolation` 表示中段用连续 IK 插补；`self_collision=off world_collision=off fcl=off` 表示该段不检查碰撞，仍检查运动学和关节动态限位。
 - `method=opt fcl=keypoints gpu_collision=on` 表示外段使用正常 GPU 轨迹避障和 FCL 关键点检查。
 - `state_ms/world_ms/solve_ms` 分别为状态同步、场景更新、OPT 求解耗时；segment_ms 为本段总耗时，不能与子项重复相加。
-- `trajectory_s` 表示计划运动时长；任务 elapsed_ms 包含规划、当前模式的控制器执行及清理耗时。
-- 夹爪张开/闭合/释放的规划日志说明生成插补轨迹；execute_* 阶段和执行完成日志说明控制器下发及结果。success 按当前启动模式判断，不表示实际夹到物体。
+- `trajectory_s` 表示计划运动时长；任务 elapsed_ms 包含规划、验收、可选的异步下发及清理耗时，不表示实际运动时长。
+- 夹爪张开/闭合/释放的规划日志说明生成插补轨迹；debug 下发日志表示向控制器提交，规划侧不等待执行结果。success 表示规划及提交阶段成功，不表示实际夹到物体。
 
 输入、初始反馈和忙状态拒绝发生在阶段计算前。失败时先看最后的 stage/reason，再看对应 FCL 或 OPT 日志。普通 OPT/MPC 的控制器执行日志仍按原接口输出。
 
@@ -365,22 +356,40 @@ ros2 run tf2_ros tf2_echo base_link camera_01_color_optical_frame
 
 MPC 仍使用原有 GPU 球碰撞，不接入本轮 OPT FCL。目标由 `/curobo/target`（`MpcTarget`）输入，启动 `/follow_mpc` 后滚动优化并发布 `MpcPlan`。当前命令序列覆盖约 0.5 s；`mpc_prewarm` 开启时缓存指定模式，没点云可空场景预热，有点云但 TF 缺失仍需等待。运行 MPC 时拒绝并发 OPT/IK 请求。
 
-辅助脚本位于 `src/curobo_ros_python/scripts/`，包括目标位姿规划、MPC 路点发布和关节跟踪记录；使用各脚本 `--help` 查看参数。
+部署调用脚本位于 `src/curobo_ros_python/scripts/`：`call_pick_place.sh` 与 `pick_place_client.py` 调用抓放 Action，`obj_pose_to_pick.py` 与 `obj_pose_to_plan.py` 接入感知目标；`perception_pick_target.py` 为感知读取共用模块。使用各入口 `--help` 查看参数。
 
-## 回归验证
+## 部署源码范围
 
-加载 ROS 环境并使用规划 Python，在仓库根目录运行：
+本仓库仅保留规划节点及模块、ROS 消息/Service/Action、运行配置、启动文件、实际调用脚本和使用文档。OPT/MPC、多目标、抓放、本体点云过滤、GPU/FCL 验收及调试启动入口继续保留。`deploy.yaml` 仍只发布规划结果；`debug.yaml` 保留原仿真执行行为。
+
+抓放调用参数统一放在 `src/curobo_ros_python/config/pick_place.yaml`，沿用清理前正在使用的参数；只调整文件名，不自动修改工件尺寸、相对位姿、夹爪开度或 end_pose。默认感知选取逻辑也保持原样。
 
 ```bash
-export PYTHONPATH="$PWD/src/curobo_ros_python:$PYTHONPATH"
-../curobo/.venv/bin/python -m unittest discover \
-  -s src/curobo_ros_python/test -p 'test_mesh_candidate_filter.py'
-../curobo/.venv/bin/python -m unittest discover \
-  -s src/curobo_ros_python/test -p 'test_opt_flow_cleanup.py'
+./src/curobo_ros_python/scripts/call_pick_place.sh pick --label 5
+./src/curobo_ros_python/scripts/call_pick_place.sh place
+./src/curobo_ros_python/scripts/call_pick_place.sh pick_place --label 5
 ```
 
-Jetson 直接运行 Python 时，按现有环境设置 `LD_PRELOAD`；正常 launch 会通过 `launch_utils` 加载已有兼容库。测试不发运动命令。
+测试、基准脚本、结果输出、历史分析报告和 CAD 草稿不随部署仓库发布。生成结果请输出到 `/tmp` 或仓库外的指定目录；构建产物、日志和虚拟环境继续忽略。
 
-## 代码工作区约定
+### 抓放插补 IK 启动预热
 
-后续默认直接在远程 `ai:/home/ai/wh/curobo_ros_python` 修改和验证，本机为同步副本。提交时必须同时包含主流程与新增 FCL/固定状态模块、策略 YAML 和测试，避免 Git 更新后仅留下无调用的孤立文件。构建产物、日志、虚拟环境和离线基准数据不属于核心源码上传范围。
+`pick_place_ik_prewarm: true` 默认在节点初始化时同步预热左右臂终点 IK 和 33/65/129 点批量 IK，完成后才输出服务和 Action 就绪日志。预热使用模型默认姿态，不依赖点云/真实关节反馈，不发布轨迹或下发控制器。正常规划仍检查真实反馈、点云和原来的碰撞策略。
+
+`pick_place_ik_prewarm_modes` 可只选择需要的手臂；`pick_place_ik_prewarm_samples` 可选 33/65/129/257/513。默认三种覆盖当前常见接近/撤退段。预热复用运行时相同缓存，改变目标位姿不会重建同规格 CUDA 图。未预热规格、其他手臂或罕见备用 IK 首次使用仍可能初始化；重启节点后缓存重建。设 false 可缩短启动，但首次使用延迟会回到任务内。
+
+日志 `[插补预热] event=完成 ready=true` 表示所选规格已完成，逐项日志记录手臂、样本数和耗时。已有 TrajOpt/MPC 预热配置继续独立生效；这项预热只将插补 IK 初始化移到启动阶段，不省略每条任务的 IK、重定时或 FK 校验。
+
+路点连续通过会记录 `event=路点通过速度`：不仅要求速度非零，还检查连接处是否仍保留原段末端的长时间低速。接触段的通过方向沿原直线路径，普通段仍按阶段恢复 GPU/FCL 验收。夹爪未张开而插入的预抓取位计划停留不做跨越平滑。
+
+预置点衔接采用两侧约 45% 峰值速度附近的运动区间，适度提高通过速度；全局速度倍率不变，仍按实际关节速度、加速度和 jerk 限位局部调整，并做原 GPU/FCL 与接触段直线验收。
+
+### 工具 Z 轴竖直偏好
+
+节点参数 `keep_tool_z_vertical`：默认值为 `false`，实际启用状态以启动 YAML 或运行时参数为准；设为 `true` 开启。它对 OPT 的关节目标、笛卡尔目标及复用这些接口的 Pick/Place/PickPlace 中间运动加入软代价，抑制工具 Z 轴偏离 base 竖直轴；朝上或朝下取当前段目标工具姿态对应的方向，绕竖直轴旋转不受这项代价限制。输入的关节目标、末端位置和终点四元数仍按原约束求解，不会被改写。
+
+这是“尽量保持”的软偏好，不保证每一帧绝对竖直；非竖直起点、非竖直目标、避障和关节限位可能要求倾斜。接触段仍遵守已指定的直线/SLERP 位姿，不覆盖用户给定的抓取、放置姿态。合并后记录 `event=工具Z竖直检查` 的实际平均/最大倾角，仍做原碰撞、直线和动态限位验收。MPC 不受此参数影响。
+
+初始化时在 CUDA Graph 捕获前安装代价；每次 OPT 求解只原地更新选中工具的权重和朝向，求解结束或失败均恢复，不污染下一次关闭该参数的规划。修改 YAML 后重启生效，也可在新版本节点上用 `ros2 param set /curobo_motion_planning_node keep_tool_z_vertical false` 切换后续规划。
+
+竖直偏好的绕路优化：允许约 15° 的小倾角，范围内不再追求绝对 0°，因此当前约 11° 的抓取姿态不与中间偏好冲突。开启时还加入起终点之间约 10 cm 半径的位置软走廊，抑制为了姿态而大幅侧移；它不是硬性直线约束，也不保证最大偏移小于 10 cm。障碍、关节限位及原碰撞验收仍生效，输入终点不被改写；关闭时这两项附加代价均为零。不额外增加一轮 OPT 求解。
