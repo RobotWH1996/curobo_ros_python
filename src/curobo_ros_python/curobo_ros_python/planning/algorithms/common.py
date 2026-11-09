@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import torch
 
 from curobo.config_io import join_path, load_yaml
 from curobo.content import get_robot_configs_path
@@ -24,13 +25,15 @@ def squeeze_pose(pose: Pose) -> Pose:
 
 
 def pose_xyz_wxyz(pose: Pose) -> Tuple[List[float], List[float]]:
-    p = pose.position.detach().reshape(-1).cpu().numpy()
-    q = pose.quaternion.detach().reshape(-1).cpu().numpy()
-    return [float(p[0]), float(p[1]), float(p[2])], [
-        float(q[0]),
-        float(q[1]),
-        float(q[2]),
-        float(q[3]),
+    pq = torch.cat((
+        pose.position.detach().reshape(-1)[:3],
+        pose.quaternion.detach().reshape(-1)[:4],
+    )).cpu().numpy()
+    return [float(pq[0]), float(pq[1]), float(pq[2])], [
+        float(pq[3]),
+        float(pq[4]),
+        float(pq[5]),
+        float(pq[6]),
     ]
 
 

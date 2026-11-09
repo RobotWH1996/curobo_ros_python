@@ -60,14 +60,16 @@ _PARAM_DEFAULTS: Dict[str, Any] = {
     "robot": "lycus.yml",
     "scene_model": "",
     "warmup_iterations": 3,
+    "trajopt_prewarm_groups": ["left_arm"],
     "pick_place_ik_prewarm": True,
-    "pick_place_ik_prewarm_modes": ["left_arm", "right_arm"],
-    "pick_place_ik_prewarm_samples": [33, 65, 129],
+    "pick_place_ik_prewarm_modes": ["left_arm"],
+    "pick_place_ik_prewarm_samples": [33],
     "use_cuda_graph": True,
     "interpolation_dt": 0.02,
     "trajopt_num_seeds": 2,
     "trajopt_finetune_attempts": 1,
     "trajopt_num_iters": 50,
+    "trajopt_interpolation_steps": 2,
     "position_tolerance": 0.005,
     "orientation_tolerance": 0.05,
     "waypoint_joint_tolerance": 0.1,
@@ -233,6 +235,7 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
             robot=robot_yaml,
             scene_model=self._p("scene_model") or None,
             warmup_iterations=int(self._p("warmup_iterations")),
+            warmup_groups=list(self._p("trajopt_prewarm_groups")),
             use_cuda_graph=self._p("use_cuda_graph"),
             interpolation_dt=self._p("interpolation_dt"),
             position_tolerance=self._p("position_tolerance"),
@@ -241,6 +244,7 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
             collision_cache=collision_cache,
             num_trajopt_seeds=int(self._p("trajopt_num_seeds")),
             trajopt_num_iters=int(self._p("trajopt_num_iters")),
+            trajopt_interpolation_steps=int(self._p("trajopt_interpolation_steps")),
             finetune_attempts=int(self._p("trajopt_finetune_attempts")),
             logger=self.get_logger(),
             self_filter_geometry=str(self._p('self_filter_mode')) != 'off',
@@ -387,7 +391,7 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
             f"控制器下发{dispatch}（execute_trajectory）。"
             "关时只把轨迹发到话题，不驱动机械臂和夹爪；"
             "开时规划成功后调用 FollowJointTrajectory。"
-            "抓放与 OPT 共用启动配置：debug 默认执行，deploy 默认只输出；整次任务规划成功后才下发。"
+            "抓放与 OPT 共用启动配置：debug 默认执行，deploy 默认只输出；抓放按自然停顿点分块验收并续接，首块可先运动。"
         )
         self.get_logger().info(
             "服务已就绪: /plan_joint_goal /plan_pose_goal /compute_ik"
@@ -567,6 +571,7 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
             f"prm={ms(stages, 'prm'):.0f}ms "
             f"trajopt={ms(stages, 'trajopt'):.0f}ms "
             f"check={ms(stages, 'check'):.0f}ms "
+            f"attempts={int(stages.get('attempts', 0))} "
             f"wall={timer.total_ms():.0f}ms"
         )
         return f"计时 {parts}"

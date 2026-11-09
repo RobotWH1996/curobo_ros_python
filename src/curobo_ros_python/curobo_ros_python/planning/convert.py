@@ -102,13 +102,17 @@ def group_goal_state(
     return JointState.from_position(pos.reshape(1, -1), joint_names=list(all_names))
 
 
-def _as_traj_2d(tensor: torch.Tensor) -> np.ndarray:
+def _traj_matrix(tensor: torch.Tensor) -> torch.Tensor:
     data = tensor.detach()
     while data.ndim > 2:
         data = data[0]
     if data.ndim == 1:
         data = data.unsqueeze(0)
-    return data.cpu().numpy()
+    return data
+
+
+def _as_traj_2d(tensor: torch.Tensor) -> np.ndarray:
+    return _traj_matrix(tensor).cpu().numpy()
 
 
 def curobo_traj_to_arrays(
@@ -121,11 +125,10 @@ def curobo_traj_to_arrays(
     if missing:
         raise RuntimeError(f"轨迹里缺少 {group_name} 的关节: {missing}")
     idx = [names.index(n) for n in keep]
-    pos = _as_traj_2d(traj.position)[:, idx]
-    vel = None
-    if traj.velocity is not None:
-        vel = _as_traj_2d(traj.velocity)[:, idx]
-    return keep, pos, vel
+    if traj.velocity is None:
+        return keep, _as_traj_2d(traj.position)[:, idx], None
+    host = torch.stack((_traj_matrix(traj.position), _traj_matrix(traj.velocity))).cpu().numpy()
+    return keep, host[0][:, idx], host[1][:, idx]
 
 
 def curobo_traj_to_msg(

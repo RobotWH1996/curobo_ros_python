@@ -11,6 +11,7 @@ import time
 import numpy as np
 import rclpy
 from rclpy.action import ActionServer, GoalResponse, CancelResponse
+from rclpy.logging import LoggingSeverity
 from curobo_ros_interfaces.action import Pick, Place, PickPlace
 from curobo_ros_python.planning.manipulation import ManipulationWorkflow, TaskCancelled
 from curobo_ros_python.planning.geom import quat_mul_wxyz, transform_pose_wxyz
@@ -18,8 +19,8 @@ from curobo_ros_python.planning.payload import Payload, pose_matrix, outside_box
 from curobo_ros_python.planning.pick_collision import set_payload
 from curobo_ros_python.planning.convert import stamped_to_pose, numpy_traj_to_msg, group_goal_state, joint_map_to_curobo
 from curobo_ros_python.planning.offline_trajectory import (
-    blend_through, continuous_runs, gripper_segment, concatenate_segments,
-    overlay_joint_motion, insert_stationary_hold, sample_trajectory, ros_duration)
+    blend_through, continuous_runs, cpu_dynamic_limits, gripper_segment, concatenate_segments,
+    host_state_arrays, overlay_joint_motion, insert_stationary_hold, sample_trajectory, ros_duration)
 from curobo.trajectory_optimizer import expand_joint_trajectory
 from curobo_ros_python.planning.groups import GROUP_JOINTS
 from curobo_ros_python.planning.trajectory import select_trajectory_joints
@@ -103,6 +104,7 @@ class PickPlaceServer:
             raise ValueError('pick_place_max_placed_objects 必须在1到16之间')
         self.lock=threading.Lock()
         self.busy=False
+        self._active_backend=None
         self.held=None
         self.placed={}
         self.placed_seq=0
@@ -113,9 +115,15 @@ class PickPlaceServer:
         for name,action in (('pick',Pick),('place',Place),('pick_place',PickPlace)):
             self.servers.append(ActionServer(node,action,name,
                 goal_callback=lambda request,k=name:self.accept(k,request),
-                cancel_callback=lambda handle:CancelResponse.ACCEPT,
+                cancel_callback=self.cancel,
                 execute_callback=lambda handle,k=name,a=action:self.execute(k,a,handle),
                 callback_group=node._action_group))
+
+    def cancel(self, handle):
+        backend=self._active_backend
+        if backend is not None and bytes(backend.handle.goal_id.uuid)==bytes(handle.goal_id.uuid):
+            backend.cancel_stream()
+        return CancelResponse.ACCEPT
 
     def accept(self,kind,request):
         try:
@@ -129,6 +137,8 @@ class PickPlaceServer:
             if self.node.execute_trajectory and self.node.executor_helper is None:
                 raise ValueError('当前启动配置启用了执行，但轨迹执行器尚未初始化')
             if self.node._mpc_following: raise RuntimeError('MPC跟踪中，请先取消')
+            if self.node.executor_helper is not None and self.node.executor_helper.execution_pending:
+                raise RuntimeError('上一条控制轨迹尚未结束')
             if self.node.pointcloud_collision!='mesh': raise ValueError('首版抓放Action需要 pointcloud_collision=mesh')
             with self.lock:
                 if self.busy: raise RuntimeError('抓放任务正忙')
@@ -175,48 +185,53 @@ class PickPlaceServer:
             held_gpu=True
             backend=TaskBackend(self,handle,action)
             backend.log_prefix=context
+            backend.started=started
+            self._active_backend=backend
             runner=ManipulationWorkflow(backend)
             if kind=='pick': runner.pick(handle.request.task)
             elif kind=='place': runner.place(handle.request.task)
             else: runner.pick_place(handle.request.pick,handle.request.place)
             backend.check()
-            backend.merge_continuous_motions(task.group_name)
+            backend.flush(task.group_name, final=True)
             backend.check()
-            result.trajectory=concatenate_segments(backend.trajectories)
-            result.trajectory.header.frame_id=self.node.base_frame
-            result.trajectory.header.stamp=self.node.get_clock().now().to_msg()
-            self.node._traj_pub.publish(result.trajectory)
+            result.trajectory=backend.full_trajectory()
             result.success=True
-            result.message='完整轨迹已发布；当前启动配置不下发控制器'
-            if self.node.execute_trajectory:
-                try:
-                    submitted,message=backend.execute_plan(task.group_name,result.trajectory)
-                    result.message='完整轨迹规划成功；'+message
-                except Exception as exc:
-                    result.message=f'完整轨迹规划成功；控制层提交异常: {exc}'
-                    self.node.get_logger().warn(result.message)
-                # Submission does not assert that the physical execution completed.
-                result.execution_completed=False
+            result.message=('完整轨迹规划成功；已按停顿点分块提交，未等待执行结果'
+                            if self.node.execute_trajectory else '完整轨迹规划成功；已分块发布，未下发控制器')
+            result.execution_completed=False
         except TaskCancelled as exc:
             result.message=str(exc)
         except Exception as exc:
             result.message=f'{type(exc).__name__}: {exc}'
         finally:
             if backend is not None:
+                if not result.success:
+                    if handle.is_cancel_requested or backend._stream_cancelled or not rclpy.ok():
+                        backend.cancel_stream()
+                    elif backend._stream is not None:
+                        # Close planning while the validated prefix finishes at its own stop.
+                        backend._stream.finish()
+                        if not backend._stream.error:
+                            result.message+='；保留已提交轨迹执行至原定停止点'
+                    if backend._completed:
+                        result.trajectory=backend.full_trajectory()
                 result.stage=backend.stage
-                result.trajectories=backend.trajectories
-                result.trajectory_stages=backend.trajectory_stages
+                result.trajectories=backend._completed
+                result.trajectory_stages=backend._completed_stages
                 try:
                     backend.cleanup()
                 except Exception as exc:
                     result.success=False
                     result.message+=f'；恢复规划状态失败: {exc}'
+                    backend.cancel_stream()
+            self._active_backend=None
             if held_gpu: self.node._gpu_lock.release()
             with self.lock: self.busy=False
         status='成功' if result.success else '取消' if handle.is_cancel_requested else '失败'
         message=(f'{context} event=结束 status={status} stage={result.stage or "validate"} '
             f'trajectories={len(result.trajectories)} '
-            f'elapsed_ms={(time.monotonic()-started)*1000:.1f} reason={result.message!r}')
+            f'elapsed_ms={(time.monotonic()-started)*1000:.1f} '
+            f'{backend.timing_summary() if backend is not None else ""} reason={result.message!r}')
         if result.success: self.node.get_logger().info(message)
         elif handle.is_cancel_requested: self.node.get_logger().warn(message)
         else: self.node.get_logger().error(message)
@@ -261,9 +276,14 @@ class TaskBackend:
                           if j.get('type')!='fixed' and j.find('mimic') is None]
         self.released_box=None
         self.last_gripper_position=0.
+        self.started=time.monotonic()
+        self._completed=[];self._completed_stages=[]
+        self._stream=None;self._stream_cancelled=False;self._stream_stamp=None
+        self._blocks=0;self._first_ready_ms=None;self._first_submit_ms=None
 
     def check(self):
-        if self.handle.is_cancel_requested: raise TaskCancelled('抓放任务已取消')
+        if self._stream is not None and self._stream.error: raise RuntimeError(self._stream.error)
+        if self.handle.is_cancel_requested or self._stream_cancelled: raise TaskCancelled('抓放任务已取消')
         if not rclpy.ok(): raise TaskCancelled('节点关闭')
         if time.monotonic()>self.deadline: raise TimeoutError('抓放任务总超时')
 
@@ -280,12 +300,65 @@ class TaskBackend:
         if level=='debug': self.node.get_logger().debug(message)
         else: self.node.get_logger().info(message)
 
-    def execute_plan(self,group,full):
-        """Hand one complete offline timeline to the control adapter, without waits."""
-        joint=group.split('_')[0]+'_gripper'
-        return self.node.executor_helper.dispatch([
-            (group,select_trajectory_joints(full,GROUP_JOINTS[group])),
-            (joint,select_trajectory_joints(full,[joint]))])
+    def cancel_stream(self):
+        self._stream_cancelled=True
+        if self._stream is not None:
+            self._stream.cancel()
+
+    def timing_summary(self):
+        ready='none' if self._first_ready_ms is None else f'{self._first_ready_ms:.1f}'
+        submit='none' if self._first_submit_ms is None else f'{self._first_submit_ms:.1f}'
+        return f'blocks={self._blocks} first_ready_ms={ready} first_submit_ms={submit}'
+
+    def full_trajectory(self):
+        trajectory=concatenate_segments(self._completed)
+        trajectory.header.frame_id=self.node.base_frame
+        if self._stream_stamp is not None:
+            trajectory.header.stamp=copy.deepcopy(self._stream_stamp)
+        return trajectory
+
+    def flush(self, group, final=False):
+        """Commit only the current stopped block; future planning cannot modify it."""
+        self.check()
+        if self.trajectories:
+            started=time.monotonic()
+            block=self.merge_continuous_motions(group)
+            if self._completed:
+                previous=self._completed[-1].points[-1];following=block.points[0]
+                for field,tolerance in (('positions',1e-6),('velocities',1e-5),('accelerations',1e-4)):
+                    if not np.allclose(getattr(previous,field),getattr(following,field),atol=tolerance,rtol=0.):
+                        raise RuntimeError(f'轨迹块接缝 {field} 不连续')
+            combined=block
+            if self._completed:
+                combined=concatenate_segments(self._completed+self.trajectories)
+                self._validated_samples(group,combined)
+            ready=time.monotonic()
+            if self._first_ready_ms is None:
+                self._first_ready_ms=(ready-self.started)*1000.
+            self.check()
+            if self.node.execute_trajectory:
+                joint=group.split('_')[0]+'_gripper'
+                commands=[(group,select_trajectory_joints(combined,GROUP_JOINTS[group])),
+                          (joint,select_trajectory_joints(combined,[joint]))]
+                if self._stream is None:
+                    self._stream=self.node.executor_helper.start_stream(commands)
+                    self._stream_stamp=copy.deepcopy(self._stream.stamp)
+                    self._first_submit_ms=(time.monotonic()-self.started)*1000.
+                else:
+                    self._stream.append(commands)
+            elif self._stream_stamp is None:
+                self._stream_stamp=self.node.get_clock().now().to_msg()
+            self._completed.extend(self.trajectories)
+            self._completed_stages.extend(self.trajectory_stages)
+            self.trajectories=[];self.trajectory_stages=[];self._segment_checks=[]
+            self._pending_open=None;self._blocks+=1
+            self.node._traj_pub.publish(self.full_trajectory())
+            self.log('轨迹块提交',f'block={self._blocks} labels={",".join(self._completed_stages)} '
+                f'block_ready_ms={(ready-started)*1000:.1f} ready_ms={(ready-self.started)*1000:.1f} '
+                f'prefix_duration_s={combined.points[-1].time_from_start.sec+combined.points[-1].time_from_start.nanosec*1e-9:.3f} '
+                f'controller={str(self.node.execute_trajectory).lower()}')
+        if final and self._stream is not None:
+            self._stream.finish()
 
     def _preflight(self,task):
         validate_common(task)
@@ -447,11 +520,49 @@ class TaskBackend:
             raise RuntimeError('已放置工件数量达到场景容量')
 
     def _current(self):
+        started=time.monotonic();rebuilt=self.virtual_state is None
+        gripper_before=getattr(self.p._gripper_state,'_previous',None)
+        fixed_before=getattr(self.p._fixed_state,'positions',None)
+        gripper_signature=getattr(self.p._gripper_state,'_model_signature',None)
+        fixed_signature=getattr(self.p._fixed_state,'_model_signature',None)
         if self.virtual_state is None:
             self.virtual_state,_=joint_map_to_curobo(self.p.joint_names,self.virtual_joints,self.p.device,
                                                     default_position=self.p.default_joint_position)
+        built=time.monotonic()
         self.p.update_gripper_state(self._collision_joints())
-        return self.virtual_state.clone()
+        updated=time.monotonic()
+        state=self.virtual_state.clone()
+        finished=time.monotonic()
+        after_signature=getattr(self.p._gripper_state,'_model_signature',None)
+        self._last_current_timing=dict(rebuilt=rebuilt,
+            build_ms=(built-started)*1000.,model_update_ms=(updated-built)*1000.,
+            clone_ms=(finished-updated)*1000.,total_ms=(finished-started)*1000.,
+            gripper_pose_changed=gripper_before!=getattr(self.p._gripper_state,'_previous',None),
+            fixed_pose_changed=fixed_before!=getattr(self.p._fixed_state,'positions',None),
+            fixed_changed_joints=','.join(name for name,value in self.p._fixed_state.positions.items()
+                if value!=(fixed_before or {}).get(name,value)),
+            fixed_max_delta_rad=max((abs(value-(fixed_before or {}).get(name,value))
+                for name,value in self.p._fixed_state.positions.items()),default=0.),
+            gripper_signature_changed=gripper_signature!=after_signature,
+            fixed_signature_changed=fixed_signature!=getattr(self.p._fixed_state,'_model_signature',None),
+            model_count=len(after_signature or ()),
+            model_entries_changed=sum(a!=b for a,b in zip(gripper_signature or (),after_signature or ()))+
+                abs(len(gripper_signature or ())-len(after_signature or ())))
+        return state
+
+    def _remember_joints(self, updates):
+        """Keep the cached GPU state aligned with virtual_joints. Missing names stay dict-only."""
+        state=self.virtual_state
+        if state is None or not state.joint_names:
+            return
+        index={name:i for i,name in enumerate(state.joint_names)}
+        position=state.position.detach().reshape(-1).cpu()
+        for name,value in updates:
+            slot=index.get(name)
+            if slot is not None:
+                position[slot]=float(value)
+        flat=state.position.reshape(-1)
+        flat.copy_(position.to(device=flat.device,dtype=flat.dtype))
 
     def _collision_joints(self):
         values=dict(self.virtual_joints)
@@ -515,6 +626,11 @@ class TaskBackend:
             pose=stamped_to_pose(target,self.p.device_cfg)
             planned=self.p.plan_pose(group,current,[{group+'_ee_link':pose}],max_attempts=3)
         solved=time.monotonic();self.check()
+        timing=self.p.last_timing
+        self.log('求解计时',
+            f"ik_ms={timing.get('ik',0.)*1000:.1f} prm_ms={timing.get('prm',0.)*1000:.1f} "
+            f"trajopt_ms={timing.get('trajopt',0.)*1000:.1f} check_ms={timing.get('check',0.)*1000:.1f} "
+            f"attempts={int(timing.get('attempts',0))}")
         if not planned.success or planned.trajectory is None: raise RuntimeError(planned.message)
         traj=self._record_motion(planned.trajectory,stage,group)
         self.log('规划完成',f'method=opt points={len(traj.points)} '
@@ -529,8 +645,11 @@ class TaskBackend:
         from curobo_ros_python.planning.cartesian_interpolation import interpolate_cartesian
         self.feedback(stage,'method=cartesian_interpolation ik=on joint_limits=on self_collision=off world_collision=off fcl=off')
         started=time.monotonic();current=self._current()
+        state_ready=time.monotonic()
         motion=self.p._sync_locked_arm(task.group_name,current)
+        sync_ready=time.monotonic()
         trajectory=self._return_segments.pop(stage,None)
+        reused=trajectory is not None
         if trajectory is None:
             trajectory,details=interpolate_cartesian(self.p,motion,current,self._target(stage),
                 task.group_name+'_ee_link',self.p.interpolation_dt,self.node.trajopt_velocity_scale,self.check)
@@ -540,7 +659,8 @@ class TaskBackend:
             goal=self._target(stage).pose;v=goal.position;q=goal.orientation
             validate_path(actual,actual[0],np.array([v.x,v.y,v.z,q.w,q.x,q.y,q.z]),
                           self.p._position_tolerance,self.p._orientation_tolerance)
-            details={'ik_samples':0,'ik_calls':0}
+            details={'ik_samples':0,'ik_calls':0,'lm_calls':0,'refine_calls':0,'ik_calls_total':0}
+        path_ready=time.monotonic()
         if stage in ('pick','place'):
             first,last=('prepick','lift') if stage=='pick' else ('preplace','retreat')
             if np.allclose(matrix(self._target(first).pose),matrix(self._target(last).pose),atol=1e-7,rtol=0):
@@ -549,10 +669,33 @@ class TaskBackend:
                     values=getattr(reverse,field,None)
                     if values is not None: setattr(reverse,field,values.flip(0)*sign)
                 self._return_segments[last]=reverse
+        reverse_ready=time.monotonic()
         self.p.last_timing={'interpolation':time.monotonic()-started}
         traj=self._record_motion(trajectory,stage,task.group_name)
+        finished=time.monotonic()
         self.log('插补完成',f'ik_samples={details["ik_samples"]} ik_calls={details["ik_calls"]} points={len(traj.points)} '
-            f'elapsed_ms={(time.monotonic()-started)*1000:.1f} collision=off')
+            f'elapsed_ms={(finished-started)*1000:.1f} collision=off '
+            f'lm_calls={details.get("lm_calls",details["ik_calls"])} refine_calls={details.get("refine_calls",0)} '
+            f'ik_calls_total={details.get("ik_calls_total",details["ik_calls"])} path_reused={str(reused).lower()}')
+
+        self.log('插补状态分项','clock=host_wall '+ ' '.join(
+            f'{name}={str(value).lower() if isinstance(value,bool) else format(value,".3e" if name=="fixed_max_delta_rad" else ".2f") if isinstance(value,float) else value}'
+            for name,value in self._last_current_timing.items()))
+        self.log('插补分项',f'clock=host_wall state_ms={(state_ready-started)*1000:.2f} '
+            f'sync_ms={(sync_ready-state_ready)*1000:.2f} path_ms={(path_ready-sync_ready)*1000:.2f} '
+            f'reverse_ms={(reverse_ready-path_ready)*1000:.2f} pack_ms={(finished-reverse_ready)*1000:.2f} '
+            f'total_ms={(finished-started)*1000:.2f}')
+        timings=details.get('timings_ms')
+        if timings is not None:
+            self.log('插补计算分项','clock=host_wall '+ ' '.join(f'{name}={value:.2f}' for name,value in timings.items())+
+                f' endpoint_cache_hit={str(details["endpoint_cache_hit"]).lower()}'
+                f' batch_cache_hit={str(details["batch_cache_hit"]).lower()}')
+        refine=details.get('refine_stats',{})
+        self.log('备用IK分项',f'calls={refine.get("calls",0)} endpoint_calls={refine.get("endpoint_calls",0)} '
+            f'continuation_calls={refine.get("continuation_calls",0)} cache_misses={refine.get("cache_misses",0)} '+
+            ' '.join(f'{name}={refine.get(name,0.):.2f}' for name in
+                ('setup_ms','sync_ms','solve_ms','select_ms','other_ms','total_ms'))+
+            ' included_in=path_ms')
 
     def merge_continuous_motions(self,group):
         """Keep source timing; open promptly and plan a hold only if needed."""
@@ -565,42 +708,42 @@ class TaskBackend:
                 merged.extend(chunk);names.extend(labels);continue
             label='+'.join(labels);stops=[]
             prepick_index=labels.index('prepick')+1 if 'prepick' in labels else None
-            if pending is not None and prepick_index is not None:
-                original_arrival=sum(t.points[-1].time_from_start.sec+t.points[-1].time_from_start.nanosec*1e-9 for t in chunk[:prepick_index])
-                if pending['duration']>original_arrival+1e-8: stops=[prepick_index]
             if len(chunk)>1:
                 trajectory,boundaries=self._blend_arm(chunk,arm,group,stops=stops,contacts=[name in ('pick','lift','place','retreat') for name in labels])
             else:
                 trajectory=copy.deepcopy(chunk[0])
                 boundaries=np.array([0.,trajectory.points[-1].time_from_start.sec+trajectory.points[-1].time_from_start.nanosec*1e-9])
             if pending is not None and prepick_index is not None:
-                if pending['duration']>float(boundaries[prepick_index])+1e-8 and prepick_index not in stops and len(chunk)>1:
-                    stops.append(prepick_index)
-                    trajectory,boundaries=self._blend_arm(chunk,arm,group,stops=stops,
-                        contacts=[name in ('pick','lift','place','retreat') for name in labels])
                 until=pending['duration'];arrival=float(boundaries[prepick_index]);wait=max(0.,until-arrival)
                 if wait>1e-8:
-                    trajectory=insert_stationary_hold(trajectory,arrival,wait)
-                    boundaries[prepick_index:]+=wait
-                    boundaries=np.insert(boundaries,prepick_index,arrival)
-                    hold=dict(contexts[prepick_index-1]);hold['stage']='prepick_open_wait'
-                    contexts.insert(prepick_index,hold)
+                    trajectory=insert_stationary_hold(trajectory,0.,wait)
+                    boundaries[1:]+=wait
+                    arrival+=wait
+                    boundaries=np.insert(boundaries,1,wait)
+                    hold=dict(contexts[0]);hold['stage']='initial_open_wait'
+                    contexts.insert(0,hold)
                 if until>0.:
                     trajectory=overlay_joint_motion(trajectory,pending['joint'],pending['start'],pending['target'],until)
                     self._open_along[label]=until
-                self.log('夹爪自动张开',f'open_s={until:.3f} prepick_arrival_s={arrival:.3f} planned_wait_s={wait:.3f} feedback_wait=false')
+                self.log('夹爪自动张开',f'open_s={until:.3f} prepick_arrival_s={arrival:.3f} initial_wait_s={wait:.3f} feedback_wait=false')
                 pending=None
+            through=[float(boundaries[index]) for index,context in enumerate(contexts[:-1],1)
+                     if context['stage'] in ('prepick','preplace','lift','retreat')]
+            if through:
+                _,_,velocity,_,_=sample_trajectory(trajectory,sample_times=through)
+                columns=[trajectory.joint_names.index(name) for name in arm]
+                if np.any(np.linalg.norm(velocity[:,columns],axis=1)<1e-5):
+                    raise RuntimeError('预置点或提升/撤退位无法连续通过')
             self._validate_merged(group,trajectory,contexts,boundaries)
             merged.append(trajectory);names.append(label)
         if pending is not None: raise RuntimeError('张开轨迹没有对应的预抓取阶段')
         combined=concatenate_segments(merged);self._validated_samples(group,combined)
         self.trajectories=merged;self.trajectory_stages=names
         self.log('合并验收完成',f'segments={len(merged)} points={len(combined.points)} elapsed_ms={(time.monotonic()-started)*1000:.1f}')
+        return combined
 
     def _dynamic_limits(self,group):
-        transition=self.p._planners[group].trajopt_solver.transition_model
-        return [x.detach().cpu().numpy().reshape(-1).clip(1e-6) for x in
-                (transition.max_velocity,transition.max_acceleration,transition.max_jerk)]
+        return cpu_dynamic_limits(self.p._planners[group].trajopt_solver.transition_model)
 
     def _blend_arm(self,chunk,arm,group,stops=(),contacts=None):
         paths=[];clocks=[];velocities=[];accelerations=[]
@@ -617,9 +760,10 @@ class TaskBackend:
         arm_index=[full_names.index(name) for name in arm]
         position=np.repeat(held.reshape(1,-1),len(piece.position),axis=0)
         velocity=np.zeros_like(position);acceleration=np.zeros_like(position)
-        position[:,arm_index]=piece.position.detach().cpu().numpy()
-        velocity[:,arm_index]=piece.velocity.detach().cpu().numpy()
-        acceleration[:,arm_index]=piece.acceleration.detach().cpu().numpy()
+        host=host_state_arrays(piece.position,piece.velocity,piece.acceleration)
+        position[:,arm_index]=host[0]
+        velocity[:,arm_index]=host[1]
+        acceleration[:,arm_index]=host[2]
         merged=numpy_traj_to_msg(full_names,position,velocity,dt=self.p.interpolation_dt,velocity_scale=1.)
         for point,row,t in zip(merged.points,acceleration,times):
             point.accelerations=row.tolist();point.time_from_start=ros_duration(round(float(t)*1e9))
@@ -659,6 +803,7 @@ class TaskBackend:
         saved_world=motion.scene_collision_checker.scene_model
         saved_scene=self.p._mesh_scenes[group];saved_environment=checker.environment
         saved_payload=checker.payload
+        bounds=motion.kinematics.get_joint_limits().position.detach().cpu().numpy()
         try:
             for index,context in enumerate(contexts):
                 self.check()
@@ -669,23 +814,26 @@ class TaskBackend:
                 self.p.update_gripper_state(values)
                 current,_=joint_map_to_curobo(self.p.joint_names,values,self.p.device,default_position=self.p.default_joint_position)
                 self.p._sync_locked_arm(group,current)
-                bounds=motion.kinematics.get_joint_limits().position.detach().cpu().numpy()
                 if np.any(positions<bounds[0]-1e-6) or np.any(positions>bounds[1]+1e-6):
                     raise RuntimeError(f"{context['stage']} 合并后超过关节位置限位")
                 actual=None
                 keep_vertical=getattr(self.p,'keep_tool_z_vertical',False)
-                if context['contact'] or keep_vertical:
+                vertical_debug=keep_vertical and self.node.get_logger().is_enabled_for(LoggingSeverity.DEBUG)
+                if context['contact'] or vertical_debug:
                     actual=self.p.fk_tool_path(state,group+'_ee_link')
-                if keep_vertical:
+                if vertical_debug:
                     quaternion=actual[:,3:]
                     z=1.-2.*(quaternion[:,1]**2+quaternion[:,2]**2)
                     tilt=np.degrees(np.arccos(np.clip(np.abs(z),0.,1.)))
-                    self.log('工具Z竖直检查',f"source_stage={context['stage']} mean_tilt_deg={tilt.mean():.2f} max_tilt_deg={tilt.max():.2f} mode=soft yaw=free")
+                    self.log('工具Z竖直检查',f"source_stage={context['stage']} mean_tilt_deg={tilt.mean():.2f} max_tilt_deg={tilt.max():.2f} mode=soft yaw=free",level='debug')
                 if context['contact']:
                     validate_path(actual,context['line_start'],context['line_end'],self.p._position_tolerance,self.p._orientation_tolerance)
                 else:
                     if checker.payload is not context['payload']: set_payload(self.p,context['payload'])
-                    motion.update_world(context['world'] if context['world'] is not None else SceneCfg())
+                    # Captured phase worlds are read-only during this GPU-locked check.
+                    # Joint geometry and payload are synchronized independently above.
+                    if motion.scene_collision_checker.scene_model is not context['world']:
+                        motion.update_world(context['world'] if context['world'] is not None else SceneCfg())
                     checker.environment=context['scene']
                     if not motion._joint_traj_is_collision_free(state):
                         raise RuntimeError(f"{context['stage']} 合并后 GPU 碰撞验收失败")
@@ -694,7 +842,8 @@ class TaskBackend:
                         collision=checker.check(keypoint)
                         if collision is not None: raise RuntimeError(f"{context['stage']} 合并后 FCL 关键点碰撞: {collision}")
         finally:
-            motion.update_world(saved_world if saved_world is not None else SceneCfg())
+            if motion.scene_collision_checker.scene_model is not saved_world:
+                motion.update_world(saved_world if saved_world is not None else SceneCfg())
             self.p._mesh_scenes[group]=saved_scene;checker.environment=saved_environment
             if checker.payload is not saved_payload: set_payload(self.p,saved_payload)
             self.p.update_gripper_state(self._collision_joints())
@@ -702,12 +851,16 @@ class TaskBackend:
     def _record_motion(self,trajectory,stage,group):
         """Pack one stopped segment and advance the offline full joint state."""
         full=expand_joint_trajectory(trajectory,self.virtual_joints,self.joint_names)
-        positions=full.position.detach().cpu().numpy().reshape(-1,len(self.joint_names))
-        velocities=None if full.velocity is None else full.velocity.detach().cpu().numpy().reshape(positions.shape)
+        host=host_state_arrays(full.position,full.velocity,full.acceleration)
+        if full.velocity is None and full.acceleration is None:
+            positions,velocities=host,None
+        else:
+            positions=host[0]
+            velocities=None if full.velocity is None else host[1]
         traj=numpy_traj_to_msg(self.joint_names,positions,velocities,dt=self.p.interpolation_dt,
                               velocity_scale=self.node.trajopt_velocity_scale)
         if full.acceleration is not None:
-            acceleration=full.acceleration.detach().cpu().numpy().reshape(positions.shape)*self.node.trajopt_velocity_scale**2
+            acceleration=host[-1]*self.node.trajopt_velocity_scale**2
             for point,row in zip(traj.points,acceleration): point.accelerations=row.tolist()
         traj.header.frame_id=self.node.base_frame
         contact=stage in ('pick','lift','place','retreat')
@@ -722,8 +875,14 @@ class TaskBackend:
             context['line_end']=np.array([v.x,v.y,v.z,q.w,q.x,q.y,q.z])
         self._segment_checks.append(context)
         self.trajectories.append(traj);self.trajectory_stages.append(stage)
-        self.virtual_joints.update(zip(self.joint_names,traj.points[-1].positions))
-        self.virtual_state=None
+        # Only this arm moved. Keep feedback-only joints at their original
+        # precision; the float32 output must not look like new head/body feedback.
+        # Gripper state is advanced explicitly by gripper(), not by arm output.
+        arm=set(GROUP_JOINTS[group])
+        finished=[(name,value) for name,value in zip(self.joint_names,traj.points[-1].positions)
+                  if name in arm]
+        self.virtual_joints.update(finished)
+        self._remember_joints(finished)
         return traj
 
     def gripper(self,task,position,stage):
@@ -745,7 +904,8 @@ class TaskBackend:
             self.trajectories.append(traj);self.trajectory_stages.append(stage)
             self._open_collision_joint=None
         self.virtual_joints[name]=target
-        self.last_gripper_position=target;self.virtual_state=None
+        self.last_gripper_position=target
+        self._remember_joints(((name,target),))
         self.check()
 
     def attach(self,task):
@@ -784,9 +944,10 @@ class TaskBackend:
             self.p._mesh_scenes[name]=prepared
 
     def _tool_matrix(self,current,tool):
+        import torch
         pose=self.p.fk_tool_poses(current)[tool]
-        return pose_matrix(pose.position.detach().cpu().numpy().reshape(-1,3)[0],
-                           pose.quaternion.detach().cpu().numpy().reshape(-1,4)[0])
+        pq=torch.cat((pose.position.detach().reshape(-1)[:3], pose.quaternion.detach().reshape(-1)[:4])).cpu().numpy()
+        return pose_matrix(pq[:3], pq[3:])
 
     def detach(self,task):
         self.feedback('detach')

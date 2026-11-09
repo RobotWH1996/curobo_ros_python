@@ -236,6 +236,12 @@ class TrajectoryExecutor:
         self._execution_fault = False
         self._awaiting_goal_ack = False
         self._parallel_run = None
+        self._stream_run = None
+        self._stream_watchdog = node.create_timer(.02, self._check_stream)
+
+    def _check_stream(self):
+        if self._stream_run is not None:
+            self._stream_run.poll()
 
     @property
     def execution_pending(self) -> bool:
@@ -243,9 +249,11 @@ class TrajectoryExecutor:
         if future is not None and future.done() and not self._awaiting_goal_ack:
             self._confirm_terminal(future)
         run = getattr(self, '_parallel_run', None)
+        stream = getattr(self, '_stream_run', None)
         return (self._execution_fault or self._awaiting_goal_ack
                 or (future is not None and not future.done())
-                or (run is not None and not run.done()))
+                or (run is not None and not run.done())
+                or (stream is not None and not stream.done()))
 
     def _confirm_terminal(self, future):
         try:
@@ -374,6 +382,8 @@ class TrajectoryExecutor:
         self._handles[group_name] = handle
 
     def cancel_sent(self) -> None:
+        if self._stream_run is not None:
+            self._stream_run.cancel()
         for handle in list(self._handles.values()):
             try:
                 handle.cancel_goal_async()
@@ -453,6 +463,22 @@ class TrajectoryExecutor:
         if error_code not in (0, successful):
             return False, f"执行失败, error_code={error_code}"
         return True, "执行成功"
+
+    def start_stream(self, commands):
+        """Start one arm/gripper prefix and retain its epoch for later appends."""
+        from curobo_ros_python.planning.trajectory_stream import TrajectoryStream
+        if self.execution_pending:
+            raise RuntimeError('上一条轨迹尚未结束，拒绝启动轨迹流')
+        if not commands or not self.switch_group(commands[0][0]):
+            raise RuntimeError('轨迹流控制器切换失败')
+        run = TrajectoryStream(self)
+        self._stream_run = run
+        try:
+            run.append(commands)
+        except Exception:
+            run.cancel()
+            raise
+        return run
 
     def dispatch(self,commands):
         """Submit the complete offline timeline; execution belongs to controllers."""

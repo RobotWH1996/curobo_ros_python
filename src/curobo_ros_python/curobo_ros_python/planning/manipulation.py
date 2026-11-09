@@ -19,6 +19,7 @@ class ManipulationWorkflow:
         b.move(task, 'prepick', contact=False)
         b.move(task, 'pick', contact=True)
         b.gripper(task, task.close_position, 'close')
+        b.flush(task.group_name)
         b.attach(task)
         b.move(task, 'lift', contact=True)
         b.enable_payload(task)
@@ -30,6 +31,7 @@ class ManipulationWorkflow:
         b.move(task, 'preplace', contact=False)
         b.move(task, 'place', contact=True)
         b.gripper(task, task.open_position, 'release')
+        b.flush(task.group_name)
         # Never detach before the opening trajectory has been generated.
         b.detach(task)
         b.move(task, 'retreat', contact=True)

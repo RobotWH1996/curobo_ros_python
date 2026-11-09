@@ -26,43 +26,17 @@ from curobo_ros_python.planning.algorithms.common import (
     robot_cfg_with_locked_joints,
     squeeze_pose,
 )
-from curobo_ros_python.planning.groups import both_arm_ee_links
+from curobo_ros_python.planning.groups import LYCUS_LEFT, LYCUS_RIGHT, both_arm_ee_links
 from curobo_ros_python.planning.gripper import GripperStateUpdater, MeasuredPostureUpdater
+from curobo_ros_python.planning.motion_collision import configure_motion_collisions, install_motion_collision
 
 # 左臂 7 关节再右臂 7 关节，与 lycus cspace 顺序一致。躯干不在表里，仍用默认 0。
 # 肘在上，肩离限位留余量，腕关节放在 0，避免 joint_5 顶到 ±3.107。
 _L_POSTURE = {
-    "AR5-5_08L-W4C1C9-ZY2_joint_1": 0.0,
-    "AR5-5_08L-W4C1C9-ZY2_joint_2": 1.20,
-    "AR5-5_08L-W4C1C9-ZY2_joint_3": -1.20,
-    "AR5-5_08L-W4C1C9-ZY2_joint_4": 1.40,
-    "AR5-5_08L-W4C1C9-ZY2_joint_5": 0.0,
-    "AR5-5_08L-W4C1C9-ZY2_joint_6": 0.0,
-    "AR5-5_08L-W4C1C9-ZY2_joint_7": 0.0,
-    "AR5-5_08R-W4C1C9-ZY2_joint_1": 0.0,
-    "AR5-5_08R-W4C1C9-ZY2_joint_2": 1.20,
-    "AR5-5_08R-W4C1C9-ZY2_joint_3": 1.20,
-    "AR5-5_08R-W4C1C9-ZY2_joint_4": 1.40,
-    "AR5-5_08R-W4C1C9-ZY2_joint_5": 0.0,
-    "AR5-5_08R-W4C1C9-ZY2_joint_6": 0.0,
-    "AR5-5_08R-W4C1C9-ZY2_joint_7": 0.0,
+    **dict(zip(LYCUS_LEFT, (0.0, 1.20, -1.20, 1.40, 0.0, 0.0, 0.0))),
+    **dict(zip(LYCUS_RIGHT, (0.0, 1.20, 1.20, 1.40, 0.0, 0.0, 0.0))),
 }
-_ZERO_POSTURE = {
-    "AR5-5_08L-W4C1C9-ZY2_joint_1": 0.0,
-    "AR5-5_08L-W4C1C9-ZY2_joint_2": 0.0,
-    "AR5-5_08L-W4C1C9-ZY2_joint_3": 0.0,
-    "AR5-5_08L-W4C1C9-ZY2_joint_4": 0.0,
-    "AR5-5_08L-W4C1C9-ZY2_joint_5": 0.0,
-    "AR5-5_08L-W4C1C9-ZY2_joint_6": 0.0,
-    "AR5-5_08L-W4C1C9-ZY2_joint_7": 0.0,
-    "AR5-5_08R-W4C1C9-ZY2_joint_1": 0.0,
-    "AR5-5_08R-W4C1C9-ZY2_joint_2": 0.0,
-    "AR5-5_08R-W4C1C9-ZY2_joint_3": 0.0,
-    "AR5-5_08R-W4C1C9-ZY2_joint_4": 0.0,
-    "AR5-5_08R-W4C1C9-ZY2_joint_5": 0.0,
-    "AR5-5_08R-W4C1C9-ZY2_joint_6": 0.0,
-    "AR5-5_08R-W4C1C9-ZY2_joint_7": 0.0,
-}
+_ZERO_POSTURE = dict.fromkeys(_L_POSTURE, 0.0)
 _POSTURE_TABLES = {
     "l": _L_POSTURE,
     "zero": _ZERO_POSTURE,
@@ -183,6 +157,8 @@ class DualArmMpc:
             if lock_joint_values is not None and name in lock_joint_values:
                 self.locked_joints[name] = float(lock_joint_values[name])
         robot_cfg["robot_cfg"]["kinematics"]["lock_joints"].update(self.locked_joints)
+        active_joints = set(robot_cfg['robot_cfg']['kinematics']['cspace']['joint_names']) - set(self.locked_joints)
+        moving = configure_motion_collisions(robot_cfg, active_joints)
         cfg = ModelPredictiveControlCfg.create(
             robot=robot_cfg,
             scene_model=None,
@@ -206,6 +182,7 @@ class DualArmMpc:
                 cache={"mesh": 1},
             )
         self.mpc = ModelPredictiveControl(cfg)
+        install_motion_collision(self.mpc, moving)
         self._gripper_state = GripperStateUpdater.from_robot(robot)
         self._measured_posture = MeasuredPostureUpdater.from_robot(robot)
         # 默认只下发 4 个点、0.105 s。点云那拍会到 0.3 s，指令先跑完，控制器停住再起步就是抖。
@@ -715,27 +692,29 @@ class DualArmMpc:
         used = self.update_goals(current_state, left_pose, right_pose, fk=current_ee)
         self._apply_posture_goal(current_state, left_pose, right_pose, tool_jac)
         result = self.step(current_state)
-        self.remember_command(result)
 
         success = False
         solve_time = 0.0
         message = ""
         if result is not None:
             solve_time = float(result.solve_time or 0.0)
-            # result.success 看的是整段时域。后面的 knot 一擦到点云，整拍就被丢掉，
-            # 日志里就是第一拍 send>0、后面每拍 send=0。本拍真正执行的是前面几个命令点，
-            # 有动作序列就下发。不要在不可行时从当前关节重解，那会丢掉热启动，手臂来回抖。
-            success = getattr(result, "action_sequence", None) is not None
             seq = getattr(result, "action_sequence", None)
-            if success and seq is not None and seq.position is not None:
-                if not torch.isfinite(seq.position).all():
-                    success = False
-                    message = "MPC 动作序列不是有限数，本拍不下发"
-                    self.forget_command()
-            if not success and not message:
+            feasible = result.success is not None and bool(result.success.all())
+            if not feasible:
+                message = "MPC 约束检查未通过，本拍不下发"
+            elif seq is None or seq.position is None:
                 message = "MPC 无动作序列"
+            elif not bool(torch.isfinite(seq.position).all()):
+                message = "MPC 动作序列不是有限数，本拍不下发"
+            else:
+                success = True
         else:
             message = "MPC 无结果"
+        if success:
+            self.remember_command(result)
+        else:
+            # Failed output was not sent, so its derivatives must not seed the next tick.
+            self.forget_command()
         return MpcStep(
             result=result,
             used=used,

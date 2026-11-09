@@ -71,13 +71,48 @@ def concatenate_segments(segments):
     return result
 
 
-def stopped_segments(trajectory, boundaries, dt, limits, velocity_scale):
+def cpu_dynamic_limits(transition):
+    """Copy velocity, acceleration and jerk limits to the host once."""
+    cached = getattr(transition, "_host_dynamic_limits", None)
+    if cached is not None:
+        return cached
+    import torch
+    rows = torch.stack([
+        item.detach().reshape(-1) for item in
+        (transition.max_velocity, transition.max_acceleration, transition.max_jerk)
+    ])
+    cached = [row.clip(1e-6) for row in rows.cpu().numpy()]
+    transition._host_dynamic_limits = cached
+    return cached
+
+
+def host_state_arrays(position, velocity=None, acceleration=None):
+    """Download matching trajectory tensors in one GPU sync."""
+    import torch
+    def flat(tensor):
+        return tensor.detach().reshape(-1, tensor.shape[-1])
+    parts = [flat(position)]
+    if velocity is not None:
+        parts.append(flat(velocity))
+    if acceleration is not None:
+        parts.append(flat(acceleration))
+    host = torch.stack(parts).cpu().numpy()
+    return host if len(parts) > 1 else host[0]
+
+
+def stopped_segments(trajectory, boundaries, dt, limits, velocity_scale, positions=None, velocities=None):
     """Retiming a fixed joint path to zero velocity/acceleration at stage ends."""
     import torch
     from curobo.types import JointState
     names=list(trajectory.joint_names)
-    positions=trajectory.position.detach().cpu().numpy().reshape(-1,len(names))
-    velocities=None if trajectory.velocity is None else trajectory.velocity.detach().cpu().numpy().reshape(positions.shape)
+    if positions is None:
+        positions=trajectory.position.detach().cpu().numpy().reshape(-1,len(names))
+    else:
+        positions=np.asarray(positions).reshape(-1,len(names))
+    if velocities is None and trajectory.velocity is not None:
+        velocities=trajectory.velocity.detach().cpu().numpy().reshape(positions.shape)
+    elif velocities is not None:
+        velocities=np.asarray(velocities).reshape(positions.shape)
     if not np.isfinite(positions).all() or len(positions)<2:
         raise ValueError('联合轨迹位置无效')
     if boundaries[0]!=0 or any(b<=a for a,b in zip(boundaries,boundaries[1:])):
@@ -109,9 +144,9 @@ def stopped_segments(trajectory, boundaries, dt, limits, velocity_scale):
             duration=(count-1)*dt*scale*1.01
         else: raise ValueError('联合轨迹重定时未满足关节动态限位')
         if not all(np.isfinite(x).all() for x in [q,v,a,jerk]): raise ValueError('联合轨迹导数无效')
-        tensor=lambda data:torch.as_tensor(data.copy(),device=trajectory.position.device,dtype=trajectory.position.dtype)
-        js=JointState.from_position(tensor(q),joint_names=names)
-        js.velocity=tensor(v);js.acceleration=tensor(a);js.jerk=tensor(jerk)
+        gpu=torch.as_tensor(np.stack((q,v,a,jerk)),device=trajectory.position.device,dtype=trajectory.position.dtype)
+        js=JointState.from_position(gpu[0],joint_names=names)
+        js.velocity=gpu[1];js.acceleration=gpu[2];js.jerk=gpu[3]
         result.append(js)
     return result
 
@@ -196,14 +231,25 @@ def sample_trajectory(trajectory, dt=.005, sample_times=None):
     if not np.isfinite(q).all(): raise ValueError('轨迹位置含非有限值')
     have_v = all(len(point.velocities) == q.shape[1] for point in points)
     have_a = have_v and all(len(point.accelerations) == q.shape[1] for point in points)
+    velocities = np.array([point.velocities for point in points]) if have_v else None
+    accelerations = np.array([point.accelerations for point in points]) if have_a else None
+    return _sample_trajectory_arrays(times, q, velocities, accelerations, dt, sample_times)
+
+
+def _sample_trajectory_arrays(times, q, velocities=None, accelerations=None, dt=.005, sample_times=None):
+    """Evaluate the same controller curve directly from time and joint arrays."""
+    have_v = velocities is not None
+    have_a = have_v and accelerations is not None
     h = np.diff(times)[:, None]
+    if len(times) < 2 or np.any(h <= 0):
+        raise ValueError('轨迹必须至少有两个时间严格递增的点')
     coefficients = np.zeros((6, len(times)-1, q.shape[1]))
     coefficients[0] = q[:-1]
     if have_v:
-        v = np.array([point.velocities for point in points])
+        v = velocities
         coefficients[1] = v[:-1]*h
         if have_a:
-            a = np.array([point.accelerations for point in points])
+            a = accelerations
             coefficients[2] = .5*a[:-1]*h*h
             c0 = q[1:]-coefficients[:3].sum(0)
             c1 = v[1:]*h-coefficients[1]-2*coefficients[2]
@@ -317,17 +363,16 @@ def blend_through(paths, joint_names, dt, limits, velocity_scale, step=.02,
             scale+=weight;slope-=weight*z/width
             mapped+=amount*width*np.sqrt(np.pi/2)*(erf(z/np.sqrt(2))-erf(-center/width/np.sqrt(2)))
         return mapped,scale,slope
-    candidate=JointTrajectory(joint_names=list(joint_names))
-    for _ in times: candidate.points.append(JointTrajectoryPoint())
     for iteration in range(24):
         retimed,node_scale,node_slope=clock(times)
-        for point,row,dq,ddq,t,scale,slope in zip(candidate.points,q,v,a,retimed,node_scale,node_slope):
-            point.positions=row.tolist();point.velocities=(dq/scale).tolist()
-            point.accelerations=(ddq/scale**2-dq*slope/scale**3).tolist()
-            point.time_from_start=ros_duration(round(t*1e9))
+        # Match the nanosecond rounding of the exported ROS Duration exactly.
+        nanoseconds=np.rint(retimed*1e9).astype(np.int64)
+        output_times=nanoseconds//1_000_000_000+(nanoseconds%1_000_000_000)*1e-9
+        scaled_velocity=v/node_scale[:,None]
+        scaled_acceleration=a/node_scale[:,None]**2-v*node_slope[:,None]/node_scale[:,None]**3
         spans=np.diff(retimed)
         check_times=(retimed[:-1,None]+spans[:,None]*np.linspace(0,1,9)).reshape(-1)
-        _,_,dv,da,dj=sample_trajectory(candidate,sample_times=check_times)
+        _,_,dv,da,dj=_sample_trajectory_arrays(output_times,q,scaled_velocity,scaled_acceleration,sample_times=check_times)
         ratio=np.ones(len(spans))
         for order,values,limit in zip((1,2,3),(dv,da,dj),limits):
             peak=np.max((np.abs(values)*velocity_scale**order/limit).reshape(len(spans),9,-1),axis=(1,2))
@@ -339,8 +384,7 @@ def blend_through(paths, joint_names, dt, limits, velocity_scale, step=.02,
         bumps.append((center,max(.2*velocity_scale,2*(times[worst+1]-times[worst])),amount))
         if retimed[-1]>10000*dt: raise ValueError('局部重定时过长')
     else: raise ValueError('衔接局部重定时未满足动态限位')
-    output_times=np.array([_point_seconds(p) for p in candidate.points])
-    _,position,velocity,acceleration,jerk=sample_trajectory(candidate,sample_times=output_times)
+    _,position,velocity,acceleration,jerk=_sample_trajectory_arrays(output_times,q,scaled_velocity,scaled_acceleration,sample_times=output_times)
     tensor=lambda values:torch.as_tensor(values.copy(),dtype=torch.float64)
     state=JointState.from_position(tensor(position),joint_names=list(joint_names))
     state.velocity=tensor(velocity);state.acceleration=tensor(acceleration);state.jerk=tensor(jerk);state.dt=tensor([dt])

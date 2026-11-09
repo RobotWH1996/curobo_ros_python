@@ -13,8 +13,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
-from curobo.config_io import join_path
-from curobo.content import get_assets_path
+from curobo.config_io import join_path, load_yaml
+from curobo.content import get_assets_path, get_task_configs_path
 from curobo.motion_planner import MotionPlanner, MotionPlannerCfg, format_ik_failure, format_plan_failure
 from curobo.types import GoalToolPose, JointState, Pose
 
@@ -36,6 +36,7 @@ from curobo_ros_python.planning.gripper import GripperStateUpdater
 from curobo_ros_python.planning.tool_z_vertical import install_vertical_cost, vertical_tool_scope
 from curobo_ros_python.planning.fixed_state import FixedJointStateUpdater
 from curobo_ros_python.planning.mesh_collision import MeshCollision, MeshCollisionChecker
+from curobo_ros_python.planning.motion_collision import configure_motion_collisions, install_motion_collision
 from curobo_ros_python.planning.ik_collision_filter import install_ik_filter
 
 
@@ -349,12 +350,20 @@ class CuroboPlanner:
         logger=None,
         self_filter_geometry: bool = False,
         keep_tool_z_vertical: bool = False,
+        trajopt_interpolation_steps: int = 2,
+        warmup_groups: Optional[Sequence[str]] = None,
     ):
         self._log = logger
+        warmup_groups = tuple(_PLAN_GROUPS if warmup_groups is None else dict.fromkeys(warmup_groups))
+        if not warmup_groups or any(group not in _PLAN_GROUPS for group in warmup_groups):
+            raise ValueError("trajopt_prewarm_groups 必须包含 left_arm / right_arm / both_arms 中的规划组")
         self.keep_tool_z_vertical = bool(keep_tool_z_vertical)
         seeds = int(num_trajopt_seeds)
         iters = int(trajopt_num_iters)
         finetune = int(finetune_attempts)
+        interpolation_steps = int(trajopt_interpolation_steps)
+        if not 1 <= interpolation_steps <= 32:
+            raise ValueError("trajopt_interpolation_steps 必须在 [1, 32] 内")
         if seeds < 1:
             raise ValueError(f"trajopt_num_seeds 必须 >= 1，收到 {seeds}")
         if finetune < 0:
@@ -386,11 +395,13 @@ class CuroboPlanner:
         self._orientation_tolerance = orientation_tolerance
         self._seeds = seeds
         self._iters = iters
+        self._interpolation_steps = interpolation_steps
         self._joint_tol = joint_tol
         self._robot = robot
         self._info(f"加载 cuRobo 机器人配置: {robot}")
         self._info(
-            f"TrajOpt: seeds={seeds}, finetune_attempts={finetune}, num_iters={iters}"
+            f"TrajOpt: seeds={seeds}, finetune_attempts={finetune}, num_iters={iters}, "
+            f"interpolation_steps={interpolation_steps}"
         )
         urdf_joints = _urdf_joint_table(self._urdf_path(robot))
         self._gripper_state = GripperStateUpdater(self._urdf_path(robot))
@@ -408,6 +419,7 @@ class CuroboPlanner:
         self._cloud_loaded: Dict[str, Any] = {}
         self._locked_pose: Dict[str, Dict[str, float]] = {}
         self.last_timing: Dict[str, float] = {}
+        self._info(f"OPT 启动预热: groups={list(warmup_groups)} iterations={warmup_iterations}")
         for group_name in _PLAN_GROUPS:
             idle = _idle_arm_joints(group_name)
             self._info(self._group_banner(group_name, idle))
@@ -425,7 +437,7 @@ class CuroboPlanner:
                 _apply_locked_joints(models, specs, {name: 0.0 for name in idle})
                 self._models[group_name] = models
             self._planners[group_name] = motion
-            if warmup_iterations > 0:
+            if warmup_iterations > 0 and group_name in warmup_groups:
                 self._info(f"Warmup {group_name} ({warmup_iterations} 次)...")
                 motion.warmup(enable_graph=True, num_warmup_iterations=warmup_iterations)
                 if idle:
@@ -433,10 +445,13 @@ class CuroboPlanner:
                     _apply_locked_joints(models, self._locked[group_name], {name: 0.0 for name in idle})
                     self._models[group_name] = models
                 self._info(f"Warmup {group_name} 完成")
+            elif warmup_iterations > 0:
+                self._info(f"OPT group={group_name} startup_prewarm=false first_request=cold_start")
             if idle:
                 self._locked_pose[group_name] = {name: 0.0 for name in idle}
         self.planner = self._planners["both_arms"]
-        self._mesh_checker = MeshCollisionChecker.from_robot(robot, retain_meshes=self_filter_geometry)
+        self._mesh_checker = MeshCollisionChecker.from_robot(
+            robot, retain_meshes=self_filter_geometry, logger=self._log)
         self._mesh_positions = {}
         self._mesh_feedback = {}
         self._mesh_scenes = {}
@@ -448,7 +463,7 @@ class CuroboPlanner:
             install_ik_filter(motion.ik_solver, self._check_mesh_candidate, self._report_mesh_candidates)
         if self._mesh_checker.skipped_links:
             self._warn(f"FCL: 以下配置连杆无 collision 几何: {self._mesh_checker.skipped_links}")
-        self._info("OPT: IK 候选已启用全机器人 FCL 自碰撞和环境碰撞筛选")
+        self._info("OPT: IK 候选已启用运动相关 FCL 检查，保留运动臂与静止本体碰撞检查")
 
     def _check_mesh_candidate(self, positions: Mapping[str, float]) -> Optional[MeshCollision]:
         started = time.perf_counter()
@@ -522,6 +537,10 @@ class CuroboPlanner:
         )
         from curobo_ros_python.planning.payload import configure_payload_links
         robot = configure_payload_links(robot)
+        moving = configure_motion_collisions(robot, GROUP_JOINTS[group_name])
+        transition = load_yaml(join_path(
+            get_task_configs_path(), "trajopt/transition_bspline_trajopt.yml"))
+        transition["transition_model_cfg"]["interpolation_steps"] = self._interpolation_steps
         cfg = MotionPlannerCfg.create(
             robot=robot,
             scene_model=self._scene_model,
@@ -532,8 +551,10 @@ class CuroboPlanner:
             orientation_tolerance=self._orientation_tolerance,
             num_trajopt_seeds=self._seeds,
             trajopt_num_iters=self._iters,
+            trajopt_transition_model=transition,
         )
         motion = MotionPlanner(cfg)
+        install_motion_collision(motion, moving)
         install_vertical_cost(motion)
         motion.waypoint_joint_tolerance = self._joint_tol
         return motion
@@ -566,27 +587,29 @@ class CuroboPlanner:
     def _sync_locked_arm(self, group_name: str, current: JointState) -> MotionPlanner:
         motion = self._planners[group_name]
         self._motion = motion
-        self._mesh_positions = dict(zip(current.joint_names, current.position.reshape(-1).detach().cpu().tolist()))
+        names = list(current.joint_names or [])
+        cpu = current.position.reshape(-1).detach().cpu()
+        self._mesh_positions = dict(zip(names, cpu.tolist()))
         self._mesh_checker.environment = self._mesh_scenes[group_name]
+        self._mesh_checker.set_motion_joints(GROUP_JOINTS[group_name])
         self.last_fcl_candidates = {}
         specs = self._locked.get(group_name) or []
         if not specs:
             return motion
-        position = current.position.reshape(-1)
-        names = list(current.joint_names or [])
         index = {name: i for i, name in enumerate(names)}
-        values = {}
-        for spec in specs:
-            if spec.name not in index:
-                raise ValueError(f"当前关节状态缺少被锁关节 {spec.name}")
-            values[spec.name] = float(position[index[spec.name]].item())
+        missing = [spec.name for spec in specs if spec.name not in index]
+        if missing:
+            raise ValueError(f"当前关节状态缺少被锁关节 {missing[0]}")
+        values = {spec.name: float(cpu[index[spec.name]]) for spec in specs}
         previous = self._locked_pose.get(group_name) or {}
         moved = any(
             abs(values[name] - float(previous.get(name, 0.0))) > _LOCK_POSE_EPS
             for name in values
         )
+        if not moved:
+            return motion
         _apply_locked_joints(self._models[group_name], specs, values)
-        if moved and motion.graph_planner is not None:
+        if motion.graph_planner is not None:
             motion.graph_planner.reset_buffer()
             self._info(f"{group_name} 锁定手臂姿态已变化，PRM 缓存已清空")
         self._locked_pose[group_name] = values
@@ -1094,6 +1117,7 @@ class CuroboPlanner:
         waypoints: Sequence[Dict[str, Pose]],
         max_attempts: int = 5,
     ) -> TrajResult:
+        self.last_timing = {}
         bad = self._prepare(group_name, waypoints)
         if bad:
             return bad
@@ -1145,6 +1169,7 @@ class CuroboPlanner:
         goals: Sequence[JointState],
         max_attempts: int = 5,
     ) -> TrajResult:
+        self.last_timing = {}
         bad = self._prepare(group_name, goals)
         if bad:
             return bad

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import struct
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -13,6 +14,42 @@ from curobo.config_io import join_path, load_yaml
 from curobo.content import get_assets_path, get_robot_configs_path
 
 GRIPPER_JOINTS = ("left_gripper", "right_gripper")
+
+
+_LOCK_FIELDS = ("position", "velocity", "acceleration", "jerk")
+
+
+def _feedback_key(positions):
+    # Compare at the float32 model input precision; keep raw feedback for FCL.
+    return tuple((name, struct.pack("f", value if value else 0.0))
+                 for name, value in positions.items())
+
+
+def _model_signature(models):
+    return tuple((id(model.config.kinematics_config.fixed_transforms),
+                  tuple(model.joint_names),
+                  None if model.lock_jointstate is None else
+                  (tuple(model.lock_jointstate.joint_names),
+                   tuple(id(getattr(model.lock_jointstate, field, None)) for field in _LOCK_FIELDS)))
+                 for model in models)
+
+
+def _update_locked_state(lock, positions, seen):
+    if lock is None:
+        return
+    key = (tuple(lock.joint_names), tuple(id(getattr(lock, field, None)) for field in _LOCK_FIELDS))
+    if key in seen:
+        return
+    seen.add(key)
+    for name, q in positions.items():
+        if name not in lock.joint_names:
+            continue
+        column = lock.joint_names.index(name)
+        lock.position[..., column] = q
+        for field in _LOCK_FIELDS[1:]:
+            tensor = getattr(lock, field, None)
+            if tensor is not None:
+                tensor[..., column] = 0.0
 
 
 @dataclass
@@ -114,17 +151,16 @@ class GripperStateUpdater:
             if not math.isfinite(q) or q < lower - 1e-6 or q > upper + 1e-6:
                 raise ValueError(f"实测关节 {name}={q} 超出 URDF 限位 [{lower}, {upper}]")
             positions[name] = min(upper, max(lower, q))
-        changed = positions != self._previous
-        signature = tuple((id(model.config.kinematics_config.fixed_transforms),
-                           id(model.lock_jointstate.position) if model.lock_jointstate is not None else None,
-                           tuple(model.joint_names))
-                          for model in models)
+        changed = self._previous is None or _feedback_key(positions) != _feedback_key(self._previous)
+        signature = _model_signature(models)
         if not changed and signature == self._model_signature:
+            self._previous = positions
             return False
         matrices = self._matrices(positions)
         if not models:
             raise RuntimeError("没有可更新的夹爪运动学模型")
         seen = set()
+        seen_locks = set()
         for model in models:
             kin = model.config.kinematics_config
             transforms = kin.fixed_transforms
@@ -147,17 +183,7 @@ class GripperStateUpdater:
                     refresh = changed
                 if refresh:
                     transforms.index_copy_(0, binding[1], matrices.to(device=transforms.device, dtype=transforms.dtype))
-            lock = model.lock_jointstate
-            if lock is not None:
-                for name, q in positions.items():
-                    if name not in lock.joint_names:
-                        continue
-                    column = lock.joint_names.index(name)
-                    lock.position[..., column] = q
-                    for field in ("velocity", "acceleration", "jerk"):
-                        tensor = getattr(lock, field, None)
-                        if tensor is not None:
-                            tensor[..., column] = 0.0
+            _update_locked_state(model.lock_jointstate, positions, seen_locks)
         self._previous = positions
         self._model_signature = signature
         return changed

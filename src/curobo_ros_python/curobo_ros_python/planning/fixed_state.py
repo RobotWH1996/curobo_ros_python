@@ -7,7 +7,8 @@ import math
 import xml.etree.ElementTree as ET
 import torch
 
-from curobo_ros_python.planning.gripper import _rotation, _vector
+from curobo_ros_python.planning.gripper import (
+    _rotation, _vector, _feedback_key, _model_signature, _update_locked_state)
 
 
 @dataclass
@@ -72,12 +73,11 @@ class FixedJointStateUpdater:
                 positions[name] = float(values[name])
             if not math.isfinite(positions[name]):
                 raise ValueError(f'Non-finite fixed joint feedback: {name}')
-        changed = positions != self.positions
-        signature = tuple((id(model.config.kinematics_config.fixed_transforms),
-                           id(model.lock_jointstate.position) if model.lock_jointstate is not None else None,
-                           tuple(model.joint_names))
-                          for model in models)
+        position_key = _feedback_key(positions)
+        changed = position_key != _feedback_key(self.positions)
+        signature = _model_signature(models)
         if not changed and signature == self._model_signature:
+            self.positions = positions
             return False
         if not self._joints:
             return False
@@ -99,28 +99,19 @@ class FixedJointStateUpdater:
                 binding = (transforms, rows, None)
             bindings.append((key, binding, model))
         matrices = None
+        seen_locks = set()
         for key, (transforms, rows, applied), model in bindings:
             # The same tensor may be shared by several rollout models.
             existing = self._bindings.get(key)
             if existing is not None:
                 applied = existing[2]
-            if applied != positions:
+            if applied != position_key:
                 if matrices is None:
                     matrices = torch.stack([self._matrix(j, positions[j.name]) for j in self._joints])
                 for row, matrix in zip(rows, matrices):
                     transforms[row].copy_(matrix.to(device=transforms.device, dtype=transforms.dtype))
-                self._bindings[key] = (transforms, rows, dict(positions))
-            lock = model.lock_jointstate
-            if lock is not None:
-                for name, q in positions.items():
-                    if name not in lock.joint_names:
-                        continue
-                    column = lock.joint_names.index(name)
-                    lock.position[..., column] = q
-                    for field in ('velocity', 'acceleration', 'jerk'):
-                        tensor = getattr(lock, field, None)
-                        if tensor is not None:
-                            tensor[..., column] = 0.
+                self._bindings[key] = (transforms, rows, position_key)
+            _update_locked_state(model.lock_jointstate, positions, seen_locks)
         self.positions = positions
         self._model_signature = signature
         return changed
