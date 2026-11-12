@@ -42,6 +42,7 @@ from curobo_ros_python.planning.convert import (
     stamped_to_pose,
 )
 from curobo_ros_python.planning.mpc_follow import MpcFollower
+from curobo_ros_python.planning.robot_profile import active_profile
 from curobo_ros_python.planning.self_filter import SelfFilterMixin
 from curobo_ros_python.planning.pointcloud import (
     cloud_to_base_points,
@@ -106,7 +107,7 @@ _PARAM_DEFAULTS: Dict[str, Any] = {
     "pointcloud_exclude_boxes": "",
     "require_pointcloud": False,
     "pointcloud_parent_frame": "base_link",
-    "pointcloud_child_frame": "camera_depth_optical_frame",
+    "pointcloud_child_frame": "auto",
     "mpc_device": "cuda:0",
     "mpc_optimization_dt": 0.14,
     "mpc_control_period": 0.10,
@@ -260,6 +261,13 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
         self._joint_map: Dict[str, float] = {}
         self._joint_received = {}
         self._pc_received = 0.0
+        self._exclude_boxes_ready = False
+        self._last_prepared_cloud = None
+        self._last_prepared_body = None
+        self._self_filter_removed_points = None
+        self._self_filter_all_removed = False
+        self._mpc_state_read_t = None
+        self._manipulation = None
         self._mpc_following = False
         self._mpc_preparing = False
         self._mpc_ready_logged = False
@@ -361,6 +369,8 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
             self._log_initialization_complete()
 
     def _prewarm_interpolation_ik(self) -> None:
+        if not active_profile().gripper_joints:
+            return
         if not bool(self._p("pick_place_ik_prewarm")):
             self.get_logger().info("[插补预热] enabled=false，新规格首次使用时初始化")
             return
@@ -449,7 +459,10 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
         self.pointcloud_parent_frame = (
             self._p("pointcloud_parent_frame") or self.base_frame
         ).lstrip("/")
-        self.pointcloud_child_frame = (self._p("pointcloud_child_frame") or "").lstrip("/")
+        cloud_frame = self._p("pointcloud_child_frame")
+        if cloud_frame == "auto":
+            cloud_frame = active_profile().camera_optical_frame
+        self.pointcloud_child_frame = cloud_frame.lstrip("/")
         self._pc_lock = threading.Lock()
         self._pc_msg: Optional[PointCloud2] = None
         self._pc_seq = 0
@@ -533,7 +546,7 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
 
     def static_exclude_boxes(self):
         """base_link 下的固定剔除盒。仿真 bag 里的夹爪用，真机留空。"""
-        if getattr(self, "_exclude_boxes_ready", False):
+        if self._exclude_boxes_ready:
             return self._exclude_boxes
         self._exclude_boxes_ready = True
         self._exclude_boxes = None
@@ -559,7 +572,7 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
 
     def _planning_timing_note(self, timer: _LapTimer) -> str:
         world = self._world_timing
-        stages = getattr(self.planner, "last_timing", {}) or {}
+        stages = self.planner.last_timing or {}
 
         def ms(source: Dict[str, float], key: str) -> float:
             return float(source.get(key, 0.0)) * 1000.0
@@ -625,7 +638,7 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
                 return self._pc_skip_or_fail(f"解析点云失败: {exc}")
         else:
             msg, pts, n_raw = prepared_cloud
-            saved_body = getattr(self, "_last_prepared_body", None)
+            saved_body = self._last_prepared_body
             self._self_filter_removed_points = (
                 np.zeros((0, 3), np.float32) if saved_body is None
                 else np.array(saved_body, dtype=np.float32, copy=True)
@@ -633,18 +646,18 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
         # Capture before payload/static masking; one offline task reuses this
         # immutable sensor snapshot, while each new request still reads live data.
         self._last_prepared_cloud = (msg, pts, n_raw)
-        removed = getattr(self, "_self_filter_removed_points", None)
+        removed = self._self_filter_removed_points
         self._last_prepared_body = (
             np.zeros((0, 3), np.float32) if removed is None
             else np.array(removed, dtype=np.float32, copy=True)
         )
         payload_filter_all_removed = False
-        if getattr(self, "_manipulation", None) is not None:
+        if self._manipulation is not None:
             had_points = bool(len(pts))
             pts = self._manipulation.filter_cloud(pts)
             payload_filter_all_removed = had_points and not len(pts)
         if pts.shape[0] == 0:
-            if payload_filter_all_removed or (self.self_filter_mode == 'apply' and getattr(self, '_self_filter_all_removed', False)):
+            if payload_filter_all_removed or (self.self_filter_mode == 'apply' and self._self_filter_all_removed):
                 self.planner.clear_pointcloud_world(group_name)
                 self._last_world_pts = pts
                 from curobo_ros_python.visualization.publish import publish_collision_world
@@ -735,7 +748,7 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
     def _follow_mpc_goal(self, _request):
         if self.executor_helper is not None and self.executor_helper.execution_pending:
             return GoalResponse.REJECT
-        manipulation = getattr(self, "_manipulation", None)
+        manipulation = self._manipulation
         if manipulation is not None and manipulation.busy:
             self.get_logger().warn("抓放任务进行中，不允许切入MPC")
             return GoalResponse.REJECT
@@ -805,10 +818,10 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
         # 第一个点永远在「下一拍」，每拍顶替后命令根本执行不到。
         # 第一个点已经在读数之后一个 knot。算得比这更慢时，丢掉超前的前缀，
         # 至少留 0.35 s，下一拍再慢也不会把指令裁没。
-        read_t = getattr(self, "_mpc_state_read_t", None)
+        read_t = self._mpc_state_read_t
         elapsed = time.monotonic() - read_t if read_t else 0.0
-        algo = getattr(self._mpc, "_mpc", None)
-        lookahead = float(getattr(algo, "optimization_dt", 0.14) or 0.14)
+        algo = self._mpc._mpc
+        lookahead = 0.14 if algo is None else float(algo.optimization_dt or 0.14)
         skip = max(0.0, elapsed - lookahead)
         actual = 0.0
         if skip > 1e-3:

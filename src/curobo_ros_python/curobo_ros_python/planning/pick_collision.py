@@ -6,8 +6,9 @@ import numpy as np
 
 
 def contact_links(group):
-    side=group.split('_')[0]
-    return (side+'_gripper_left_jaw',side+'_gripper_right_jaw')
+    from curobo_ros_python.planning.robot_profile import active_profile
+
+    return active_profile().jaw_link_names(group.split('_')[0])
 
 
 def models(planner):
@@ -24,11 +25,22 @@ def models(planner):
 
 def set_payload(planner,payload):
     """Update all solver copies in place; preserve CUDA graph tensor addresses."""
+    write_payload_spheres(models(planner), payload)
+    planner._mesh_checker.payload=payload
+    for motion in planner._planners.values():
+        if motion.graph_planner is not None: motion.graph_planner.reset_buffer()
+
+
+def write_payload_spheres(configurations, payload):
+    """Write preallocated payload sphere tensors in place."""
     import torch
+    from curobo_ros_python.planning.robot_profile import active_profile
+
+    naming = active_profile()
     bindings=[]
-    for kin in models(planner):
+    for kin in configurations:
         for group in ('left_arm','right_arm'):
-            name='pick_place_'+group+'_payload'
+            name = naming.payload_link_name(group)
             if name not in kin.link_name_to_idx_map: continue
             indices=kin.get_sphere_index_from_link_name(name)
             if len(indices)!=27: raise RuntimeError(f'{name} 未预留27个碰撞球')
@@ -37,25 +49,24 @@ def set_payload(planner,payload):
             bindings.append((kin,indices,torch.as_tensor(data,device=kin.link_spheres.device,dtype=kin.link_spheres.dtype)))
     if payload is not None and not bindings: raise RuntimeError('模型没有携物碰撞球预留，请重新启动节点')
     for kin,indices,data in bindings: kin.link_spheres[:,indices,:]=data
-    planner._mesh_checker.payload=payload
-    for motion in planner._planners.values():
-        if motion.graph_planner is not None: motion.graph_planner.reset_buffer()
 
 
 @contextmanager
 def contact_scope(planner,group,enabled=False,disable_payload=False,suspend_fcl=False):
     """Only finger WORLD contacts relaxed in FCL; self contacts remain checked."""
     checker=planner._mesh_checker
-    previous=getattr(checker,'environment_ignore_links',set())
-    old_payload=getattr(checker,'payload',None)
-    old_skip=getattr(checker,'skip_fcl_checks',False)
+    previous=set(checker.environment_ignore_links)
+    old_payload=checker.payload
+    old_skip=checker.skip_fcl_checks
     saved=[]
     try:
         checker.skip_fcl_checks=suspend_fcl
         if disable_payload: checker.payload=None
         if enabled:
+            from curobo_ros_python.planning.robot_profile import active_profile
+
             links=list(contact_links(group))
-            if disable_payload: links.append('pick_place_'+group+'_payload')
+            if disable_payload: links.append(active_profile().payload_link_name(group))
             for kin in models(planner):
                 for link in links:
                     if link not in kin.link_name_to_idx_map: raise ValueError(f'模型缺少接触连杆 {link}')

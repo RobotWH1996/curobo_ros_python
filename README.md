@@ -359,7 +359,7 @@ ros2 service call /plan_joint_goal curobo_ros_interfaces/srv/PlanJointGoal \
 
 ## 点云与 MPC
 
-默认订阅 `/all_points`，按 `base_link <- camera_01_color_optical_frame` 变换；`pointcloud_child_frame` 为空时采用消息 `header.frame_id`。相机跟随头部运动，因此每次获取 TF。
+默认订阅 `/all_points`。`pointcloud_child_frame: auto` 使用机器人 YAML 中的 `camera_optical_frame`，Lycus 使用 `camera_01_color_optical_frame`，K100 采用点云消息的 `header.frame_id`。也可填写具体帧名，或将参数设为 `""` 来使用消息帧。相机跟随头部运动，因此每次获取 TF。
 
 `require_pointcloud: false` 时缺少点云/TF 可能按空场景规划；FCL 日志会写明 `空场景（未检查环境障碍）`。需要强制环境保护时在 YAML 中设为 `true`。可用以下命令诊断：
 

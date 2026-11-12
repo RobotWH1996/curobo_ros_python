@@ -36,6 +36,7 @@ class MpcFollower:
         self._last_warn_right = 0.0
         self._cloud_note = ""
         self._loaded_pc_seq = None
+        self._loaded_pc_group = None
         self._filter_retry_seq = None
 
     def on_target(self, msg: MpcTarget):
@@ -211,11 +212,11 @@ class MpcFollower:
         node = self._node
         self._cloud_note = ""
         if group_name is None:
-            target = getattr(self, '_target', None)
+            target = self._target
             left = bool(target is not None and target.has_left)
             right = bool(target is not None and target.has_right)
             group_name = 'left_arm' if left and not right else 'right_arm' if right and not left else 'both_arms'
-        if getattr(self, '_loaded_pc_group', None) != group_name:
+        if self._loaded_pc_group != group_name:
             self._loaded_pc_seq = None
             self._filter_retry_seq = None
             self._loaded_pc_group = group_name

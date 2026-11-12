@@ -40,7 +40,7 @@ _OVERRIDE_ARGS = (
     ("filter_pointcloud", bool, "true 时对点云做距离滤波和体素下采样"),
     ("require_pointcloud", bool, None),
     ("pointcloud_parent_frame", None, "点云 TF 父坐标系，规划前查 TF"),
-    ("pointcloud_child_frame", None, "点云所在坐标系；空则用消息 header.frame_id"),
+    ("pointcloud_child_frame", None, "点云所在坐标系，auto 使用机器人配置，未配置则用消息帧"),
 )
 
 

@@ -61,8 +61,13 @@ def _launch_setup(context, *args, **kwargs):
                 remappings=[('joint_states', settings.get('joint_states_topic', '/joint_states'))],
             ))
         if publish_camera == "true":
+            from curobo_ros_python.planning.robot_profile import robot_profile
+
+            profile = robot_profile(robot or settings.get('robot', 'lycus.yml'))
             parent = LaunchConfiguration('camera_parent_frame').perform(context).lstrip('/')
             child = LaunchConfiguration('camera_frame').perform(context).lstrip('/')
+            parent = parent or profile.camera_parent_frame
+            child = child or profile.camera_optical_frame
             links = {link.attrib['name'] for link in ET.fromstring(urdf).findall('link')}
             if parent not in links or not child or child in links:
                 raise RuntimeError('相机静态 TF 父系须存在于 URDF，子系须不在 URDF 中，避免重复发布')
@@ -107,8 +112,10 @@ def generate_launch_description():
                                   description='TF 使用的 URDF；空则从规划器 robot YAML 解析'),
             DeclareLaunchArgument('publish_camera_tf', default_value='false',
                                   description='发布 camera_parent_frame 到光学系的静态外参'),
-            DeclareLaunchArgument('camera_parent_frame', default_value='camera_01_link'),
-            DeclareLaunchArgument('camera_frame', default_value='camera_01_color_optical_frame'),
+            DeclareLaunchArgument('camera_parent_frame', default_value='',
+                                  description='空则用 config/robots 里该机器人的相机父系'),
+            DeclareLaunchArgument('camera_frame', default_value='',
+                                  description='空则用 config/robots 里该机器人的光学系'),
             DeclareLaunchArgument('camera_xyz', default_value='0 0 0',
                                   description='光学系在父系中的平移，m；启用前核对标定值'),
             DeclareLaunchArgument('camera_rpy', default_value='-1.5707963267948966 0 -1.5707963267948966',

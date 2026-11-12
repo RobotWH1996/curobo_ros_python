@@ -125,22 +125,22 @@ def joint_goal_marker_items(node, group_name: str, goals) -> list:
 
 def publish_goal_waypoints(node, items) -> bool:
     """发布笛卡尔或关节角目标路点。与规划成败无关，关 visualize_goal_waypoints 才不发。"""
-    pub = getattr(node, "_goal_marker_pub", None)
-    if not getattr(node, "visualize_goal_waypoints", False) or pub is None:
+    pub = node._goal_marker_pub
+    if not node.visualize_goal_waypoints or pub is None:
         return False
     pub.publish(goal_waypoints_to_markers(items, frame_id=node.base_frame))
     return True
 
 
 def publish_collision_world(node, points) -> bool:
-    if not getattr(node, "visualize_mesh_obstacles", False) or node._world_marker_pub is None:
+    if not node.visualize_mesh_obstacles or node._world_marker_pub is None:
         return False
     node._world_marker_pub.publish(
         collision_voxels_to_markers(
             points,
             pitch=node.pointcloud_pitch,
             frame_id=node.pointcloud_parent_frame or node.base_frame,
-            body_points=getattr(node, "_self_filter_removed_points", None),
+            body_points=node._self_filter_removed_points,
         )
     )
     return True
@@ -148,7 +148,7 @@ def publish_collision_world(node, points) -> bool:
 
 def publish_trajopt(node, traj: JointTrajectory, ee_paths) -> List[str]:
     published: List[str] = []
-    if not getattr(node, "visualize_trajectory", False) or node._display_pub is None:
+    if not node.visualize_trajectory or node._display_pub is None:
         return published
     node._display_pub.publish(
         joint_traj_to_display(
@@ -164,7 +164,7 @@ def publish_trajopt(node, traj: JointTrajectory, ee_paths) -> List[str]:
 
 def clear_trajopt_preview(node) -> None:
     """清掉 TrajOpt 绿线和 /display_planned_path，避免切到 MPC 后还留着。"""
-    if not getattr(node, "visualize_trajectory", False):
+    if not node.visualize_trajectory:
         return
     if node._marker_pub is not None:
         node._marker_pub.publish(clear_trajopt_markers(frame_id=node.base_frame))
@@ -175,7 +175,7 @@ def clear_trajopt_preview(node) -> None:
 
 
 def publish_mpc_preview(node, mpc, step) -> None:
-    if not getattr(node, "visualize_trajectory", False):
+    if not node.visualize_trajectory:
         return
     ee_paths = {}
     if step is not None and step.result is not None:
@@ -232,6 +232,6 @@ def publish_mpc_preview(node, mpc, step) -> None:
 
 
 def clear_mpc_preview(node) -> None:
-    if not getattr(node, "visualize_trajectory", False) or node._marker_pub is None:
+    if not node.visualize_trajectory or node._marker_pub is None:
         return
     node._marker_pub.publish(clear_mpc_markers(frame_id=node.base_frame))

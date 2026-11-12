@@ -42,5 +42,9 @@ output/
 benchmarks/
 test/
 tests/
+# Keep the pick/place and robot configuration regression checks.
+!/tests/
+/tests/*
+!/tests/test_pick_place.py
 *.FCStd
 *.FCStd1

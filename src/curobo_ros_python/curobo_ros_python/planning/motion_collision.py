@@ -67,6 +67,12 @@ def install_motion_collision(owner, moving: frozenset[str]) -> None:
             rollouts.extend(item.get_all_rollout_instances())
         pending.extend(getattr(item, name, None) for name in
                        ('ik_solver', 'trajopt_solver', 'seed_ik_solver', 'graph_planner'))
+    from curobo_ros_python.planning.curobo_adapter import (
+        collision_scope,
+        replace_method,
+        set_collision_scope,
+    )
+
     seen = set()
     costs = []
     for rollout in rollouts:
@@ -80,8 +86,9 @@ def install_motion_collision(owner, moving: frozenset[str]) -> None:
             if cost is None or id(cost) in seen:
                 continue
             seen.add(id(cost))
-            if getattr(cost, '_moving_collision_links', None) is not None:
-                if cost._moving_collision_links != moving:
+            scope = collision_scope(cost)
+            if scope is not None:
+                if scope.moving != moving:
                     raise RuntimeError('GPU collision cost is shared by different motion groups')
                 continue
             original = cost.forward
@@ -97,9 +104,8 @@ def install_motion_collision(owner, moving: frozenset[str]) -> None:
                 masked = replace(state, robot_spheres=torch.cat((spheres[..., :3], radius[..., None]), -1))
                 return _forward(masked, *args, **kwargs)
 
-            cost.forward = wraps(original)(scoped_forward)
-            cost._moving_collision_links = moving
+            replace_method(cost, "forward", wraps(original)(scoped_forward))
+            set_collision_scope(cost, moving)
             costs.append(cost)
     if not costs:
         raise RuntimeError('No GPU scene collision costs available for motion scoping')
-    owner._moving_collision_costs = costs

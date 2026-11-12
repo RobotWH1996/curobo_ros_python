@@ -1,0 +1,37 @@
+# K100 的机器人相关名字。关节顺序与 FollowJointTrajectory 控制器一致。
+# K100 用灵巧手而不是夹爪，也没有躯干关节，所以夹爪和躯干项留空：
+# 这些空值保持现有行为，不把头部或手指关节纳入反馈更新。
+robot_id: k100
+left_joints:
+  - left_shoulder_pitch_joint
+  - left_shoulder_roll_joint
+  - left_shoulder_yaw_joint
+  - left_elbow_joint
+  - left_wrist_roll_joint
+  - left_wrist_pitch_joint
+  - left_wrist_yaw_joint
+right_joints:
+  - right_shoulder_pitch_joint
+  - right_shoulder_roll_joint
+  - right_shoulder_yaw_joint
+  - right_elbow_joint
+  - right_wrist_roll_joint
+  - right_wrist_pitch_joint
+  - right_wrist_yaw_joint
+ee_links:
+  left_arm: left_arm_ee_link
+  right_arm: right_arm_ee_link
+ee_joint_prefix:
+  left_arm_ee_link: left_
+  right_arm_ee_link: right_
+gripper_joints: {}
+gripper_controllers: {}
+posture_joints: []
+gripper_base_link: ""
+jaw_links: []
+payload_link: "pick_place_{group}_payload"
+fcl_self_collision: ""
+camera_parent_frame: ""
+camera_optical_frame: ""
+# 没有单独标定的收拢姿态。l 和 zero 都是空表，优化时各关节保持默认位置。
+posture_goals: {}

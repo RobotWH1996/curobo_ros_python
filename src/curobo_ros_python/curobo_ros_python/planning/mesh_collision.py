@@ -146,6 +146,7 @@ class MeshCollisionChecker:
         self.environment: dict[str, tuple[Any, np.ndarray]] = {}
         self.environment_ignore_links = set()
         self.payload = None
+        self.skip_fcl_checks = False
         self._moving_links = None
         self._motion_masks = {}
         self._moving_mask = np.ones(len(self.names), dtype=bool)
@@ -167,16 +168,14 @@ class MeshCollisionChecker:
         self._moving_links, self._moving_mask, self._motion_pairs = self._motion_masks[key]
 
     @staticmethod
-    def _lycus_fcl_policy_path() -> Path:
+    def _fcl_policy_path(name: str) -> Path:
         """FCL 忽略表放在包的 config/，与 GPU 球体表分开。"""
-        source = Path(__file__).resolve().parents[2] / 'config' / 'lycus_fcl_collision.yaml'
-        if source.is_file():
-            return source
-        from ament_index_python.packages import get_package_share_directory
-        installed = Path(get_package_share_directory('curobo_ros_python')) / 'config' / 'lycus_fcl_collision.yaml'
-        if installed.is_file():
-            return installed
-        raise FileNotFoundError(f'找不到 Lycus FCL 自碰撞表: {installed}')
+        from curobo_ros_python.planning.robot_profile import config_dir
+
+        path = config_dir() / name
+        if path.is_file():
+            return path
+        raise FileNotFoundError(f'找不到 FCL 自碰撞表 {name}: {path}')
 
     @classmethod
     def from_robot(cls, robot: str, retain_meshes: bool = False, logger=None) -> MeshCollisionChecker:
@@ -186,9 +185,12 @@ class MeshCollisionChecker:
         config = load_yaml(join_path(str(get_robot_configs_path()), robot))['robot_cfg']['kinematics']
         # Packaged OPT policy is independent of the GPU sphere policy. Other
         # robots retain their existing policy until a dedicated table is supplied.
-        if Path(robot).stem == 'lycus':
+        from curobo_ros_python.planning.robot_profile import robot_profile
+
+        policy_name = robot_profile(robot).fcl_self_collision
+        if policy_name:
             import yaml
-            policy_path = cls._lycus_fcl_policy_path()
+            policy_path = cls._fcl_policy_path(policy_name)
             policy = yaml.safe_load(policy_path.read_text())
             ignored = policy['self_collision_ignore']
             if not isinstance(ignored, dict) or any(
@@ -284,7 +286,7 @@ class MeshCollisionChecker:
         return np.array([transforms[name] for name in (self.names if link_names is None else link_names)])
 
     def check(self, positions: Mapping[str, float]) -> MeshCollision | None:
-        if getattr(self, 'skip_fcl_checks', False):
+        if self.skip_fcl_checks:
             return None
         transforms = self._transforms(positions)
         for obj, transform in zip(self.objects, transforms):
@@ -306,22 +308,25 @@ class MeshCollisionChecker:
         for name, (obj, bounds) in self.environment.items():
             overlap = self._moving_mask & ((high >= bounds[0]) & (bounds[1] >= low)).all(1)
             for i in np.flatnonzero(overlap):
-                if self.names[i] in getattr(self, "environment_ignore_links", set()):
+                if self.names[i] in self.environment_ignore_links:
                     continue
                 if intersects(self.objects[i], obj):
                     return MeshCollision('environment', self.names[i], name)
         return self._check_payload(positions, transforms)
 
     def _check_payload(self, positions, robot_transforms):
-        payload = getattr(self, 'payload', None)
+        payload = self.payload
         if payload is None:
             return None
         from curobo_ros_python.planning.payload import outside_box
         transform = self._transforms(positions, [payload.tool])[0] @ payload.in_tool
         obj = self.fcl.CollisionObject(self.fcl.Box(*payload.size),
             self.fcl.Transform(transform[:3, :3], transform[:3, 3]))
+        from curobo_ros_python.planning.robot_profile import active_profile
+
         side = payload.group.split('_')[0]
-        allowed = {payload.tool, side+'_gripper_base', side+'_gripper_left_jaw', side+'_gripper_right_jaw'}
+        profile = active_profile()
+        allowed = {payload.tool, profile.gripper_base_name(side), *profile.jaw_link_names(side)}
         payload_moves = self._moving_links is None or payload.tool in self._moving_links
         for name, robot_obj in zip(self.names, self.objects):
             if name in allowed or (not payload_moves and name not in self._moving_links):

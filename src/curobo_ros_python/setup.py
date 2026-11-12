@@ -7,6 +7,7 @@ package_name = "curobo_ros_python"
 _config_files = [
     p for p in glob("config/*.yml") + glob("config/*.yaml") if os.path.isfile(p)
 ]
+_robot_files = [p for p in glob("config/robots/*.yaml") if os.path.isfile(p)]
 _data_files = [
     ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
     ("share/" + package_name, ["package.xml"]),
@@ -14,6 +15,10 @@ _data_files = [
 ]
 if _config_files:
     _data_files.append((os.path.join("share", package_name, "config"), _config_files))
+if _robot_files:
+    _data_files.append(
+        (os.path.join("share", package_name, "config", "robots"), _robot_files)
+    )
 
 setup(
     name=package_name,

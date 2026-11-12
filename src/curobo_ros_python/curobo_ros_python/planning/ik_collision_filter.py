@@ -62,4 +62,6 @@ def install_ik_filter(solver: Any, check: Callable, report: Callable) -> None:
         report(checked, rejected)
         return result
 
-    solver.solve_pose = solve_pose
+    from curobo_ros_python.planning.curobo_adapter import replace_method
+
+    replace_method(solver, "solve_pose", solve_pose)

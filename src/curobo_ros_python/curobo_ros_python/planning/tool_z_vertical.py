@@ -82,7 +82,9 @@ def install_vertical_cost(motion):
             costs.append(cost)
     if not costs:
         raise RuntimeError('OPT 没有可接入的工具姿态代价')
-    motion._vertical_tool_costs = costs
+    from curobo_ros_python.planning.curobo_adapter import set_vertical_costs
+
+    set_vertical_costs(motion, costs)
 
 
 @contextmanager
@@ -93,7 +95,9 @@ def vertical_tool_scope(motion, enabled, frames, goal_poses=None, goal_state=Non
         return
     if goal_poses is None:
         goal_poses = motion.compute_kinematics(goal_state).tool_poses
-    costs = motion._vertical_tool_costs
+    from curobo_ros_python.planning.curobo_adapter import vertical_costs
+
+    costs = vertical_costs(motion)
     saved = [(cost, cost.vertical_weight.clone(), cost.vertical_sign.clone()) for cost in costs]
     try:
         for frame in frames:

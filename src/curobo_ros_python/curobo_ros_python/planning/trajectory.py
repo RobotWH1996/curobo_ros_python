@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import time
-import threading
 import copy
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from action_msgs.msg import GoalStatus
-from builtin_interfaces.msg import Duration, Time
+from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
 from controller_manager_msgs.srv import SwitchController
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from curobo_ros_python.planning.groups import GROUP_ACTION, GROUP_CONTROLLER_SWITCH, GROUP_JOINTS
+from curobo_ros_python.planning.groups import (
+    GROUP_ACTION,
+    GROUP_CONTROLLER_SWITCH,
+    GROUP_JOINTS,
+)
+from curobo_ros_python.planning.robot_profile import active_profile
 
 
 def _as_2d(arr) -> np.ndarray:
@@ -220,9 +224,7 @@ class TrajectoryExecutor:
     def __init__(self, node: Node, switch_controllers: bool = True):
         self._node = node
         self._switch = switch_controllers
-        self._actions = {**GROUP_ACTION,
-                'left_gripper': '/left_gripper_controller/follow_joint_trajectory',
-                'right_gripper': '/right_gripper_controller/follow_joint_trajectory'}
+        self._actions = {**GROUP_ACTION, **active_profile().gripper_controllers}
         self._clients = {group: ActionClient(node, FollowJointTrajectory, action)
                          for group, action in self._actions.items()}
         self._switch_client = node.create_client(
@@ -235,7 +237,6 @@ class TrajectoryExecutor:
         self._unresolved_execution = None
         self._execution_fault = False
         self._awaiting_goal_ack = False
-        self._parallel_run = None
         self._stream_run = None
         self._stream_watchdog = node.create_timer(.02, self._check_stream)
 
@@ -248,11 +249,9 @@ class TrajectoryExecutor:
         future = self._unresolved_execution
         if future is not None and future.done() and not self._awaiting_goal_ack:
             self._confirm_terminal(future)
-        run = getattr(self, '_parallel_run', None)
-        stream = getattr(self, '_stream_run', None)
+        stream = self._stream_run
         return (self._execution_fault or self._awaiting_goal_ack
                 or (future is not None and not future.done())
-                or (run is not None and not run.done())
                 or (stream is not None and not stream.done()))
 
     def _confirm_terminal(self, future):
@@ -480,78 +479,6 @@ class TrajectoryExecutor:
             raise
         return run
 
-    def dispatch(self,commands):
-        """Submit the complete offline timeline; execution belongs to controllers."""
-        from rclpy.duration import Duration as ClockDuration
-        for group,trajectory in commands:
-            if not trajectory_is_finite(trajectory): return False,'控制适配器收到无效轨迹'
-            client=self._clients.get(group)
-            if client is None or not client.server_is_ready():
-                return False,f'控制器不可用: {group}；规划结果已保留'
-        if not self.switch_group(commands[0][0]): return False,'控制器切换失败；规划结果已保留'
-        stamp=(self._node.get_clock().now()+ClockDuration(seconds=.05)).to_msg()
-        for group,trajectory in commands:
-            goal=FollowJointTrajectory.Goal();goal.trajectory=copy_joint_trajectory(trajectory)
-            goal.trajectory.header.stamp=copy.deepcopy(stamp)
-            future=self._clients[group].send_goal_async(goal)
-            future.add_done_callback(lambda result,g=group:self._on_goal_response(g,result))
-        return True,'完整轨迹已异步提交控制层，未等待执行结果'
-
-    def execute_concurrent(self, commands, timeout_sec: float = 60.0, cancel_check=None):
-        """Preflight all controllers, then start against one future ROS timestamp.
-
-        Late acknowledgements remain tracked and are cancelled. Only terminal
-        action results confirm a stop; a cancellation acknowledgement does not.
-        """
-        if self.execution_pending:
-            return False, "上一段轨迹尚未确认停止，拒绝发送新轨迹"
-        deadline = time.monotonic() + timeout_sec
-        cancelled = lambda: ((cancel_check is not None and cancel_check()) or time.monotonic() >= deadline)
-        if cancelled(): return False, "执行前已取消或超时"
-        if not commands: return False, "轨迹为空"
-        if len({group for group, _ in commands}) != len(commands):
-            return False, "并行轨迹不能重复使用同一控制器"
-        for group, trajectory in commands:
-            if not trajectory_is_finite(trajectory): return False, "轨迹为空或含非有限值"
-            if group not in self._clients: return False, f"未知规划组: {group}"
-            if cancelled(): return False, "准备控制器超时或已取消"
-            if not self.switch_group(group, timeout_sec=min(3., max(0., deadline-time.monotonic()))):
-                return False, "控制器切换失败"
-            if not self._clients[group].wait_for_server(timeout_sec=min(2., max(0., deadline-time.monotonic()))):
-                return False, f"Action 不可用: {self._actions[group]}"
-        if cancelled(): return False, "发送轨迹前已取消或超时"
-        # Both controllers receive the same timestamp, regardless of send/ACK order.
-        # Reserve 100 ms for cancellation before the scheduled start if an ACK is late.
-        lead = .5
-        start_ns = self._node.get_clock().now().nanoseconds + round(lead*1e9)
-        ack_deadline = min(deadline, time.monotonic()+lead-.1)
-        run = _ControllerRun(self)
-        self._parallel_run = run
-        try:
-            for group, trajectory in commands:
-                goal = FollowJointTrajectory.Goal()
-                goal.trajectory = copy_joint_trajectory(trajectory)
-                goal.trajectory.header.stamp = Time(sec=start_ns//1_000_000_000, nanosec=start_ns%1_000_000_000)
-                run.send(self._clients[group], goal)
-        except Exception as exc:
-            run.fail(f"发送控制器目标异常: {exc}", unknown=True)
-        finally:
-            run.sending = False
-        acknowledged = type('Acknowledged', (), {'done': lambda _: run.acknowledged()})()
-        ok = _wait_future(acknowledged, max(0.,ack_deadline-time.monotonic()),
-                          lambda: cancelled() or bool(run.error))
-        if not ok or run.error or cancelled():
-            reason=run.error or "并行目标未在共同起步前确认或任务已取消"
-            run.cancel()
-            _wait_future(run, 3.)
-            return False, reason + ("；已确认停止" if run.done() else "；停止尚未确认")
-        if not _wait_future(run, max(0.,deadline-time.monotonic()), lambda: cancelled() or bool(run.error)) or run.error:
-            reason=run.error or "并行执行超时或已取消"
-            run.cancel()
-            _wait_future(run, 3.)
-            return False, reason + ("；已确认停止" if run.done() else "；停止尚未确认")
-        return True, "执行成功"
-
     def _cancel_handles(self, handles) -> None:
         for handle in handles:
             try:
@@ -570,73 +497,3 @@ class TrajectoryExecutor:
         if error_code not in (0, successful):
             return f"执行失败, error_code={error_code}"
         return ""
-
-
-class _ControllerRun:
-    """Own ACK/result futures until every controller has confirmed termination."""
-    def __init__(self, executor):
-        self.executor=executor
-        self.lock=threading.RLock()
-        self.pending_ack=set()
-        self.pending_result=set()
-        self.handles=[]
-        self.sending=True
-        self.cancelled=False
-        self.error=''
-        self.fault=False
-
-    def done(self):
-        with self.lock:
-            return not (self.sending or self.pending_ack or self.pending_result or self.fault)
-
-    def acknowledged(self):
-        with self.lock: return not self.sending and not self.pending_ack
-
-    def fail(self, message, unknown=False):
-        with self.lock:
-            self.error=self.error or message
-            if unknown:
-                self.fault=True
-                self.executor._execution_fault=True
-
-    def send(self, client, goal):
-        future=client.send_goal_async(goal)
-        with self.lock: self.pending_ack.add(future)
-        future.add_done_callback(self._ack)
-
-    def _ack(self, future):
-        with self.lock:
-            try:
-                handle=future.result()
-                if handle is None or not handle.accepted:
-                    self.fail('控制器拒绝并行轨迹')
-                else:
-                    self.handles.append(handle)
-                    result=handle.get_result_async()
-                    self.pending_result.add(result)
-                    result.add_done_callback(self._result)
-                    if self.cancelled: self.executor._cancel_handles([handle])
-            except Exception as exc:
-                self.fail(f'控制器目标确认异常，停止状态未确认: {exc}',unknown=True)
-            finally:
-                self.pending_ack.discard(future)
-
-    def _result(self, future):
-        with self.lock:
-            try:
-                wrapped=future.result()
-                terminal=(GoalStatus.STATUS_SUCCEEDED,GoalStatus.STATUS_CANCELED,GoalStatus.STATUS_ABORTED)
-                if wrapped is None or getattr(wrapped,'status',None) not in terminal:
-                    self.fail('控制器未返回明确的终止状态',unknown=True)
-                else:
-                    error=self.executor._goal_error(wrapped)
-                    if error: self.fail(error)
-            except Exception as exc:
-                self.fail(f'控制器结果异常，停止状态未确认: {exc}',unknown=True)
-            finally:
-                self.pending_result.discard(future)
-
-    def cancel(self):
-        with self.lock:
-            self.cancelled=True
-            self.executor._cancel_handles(list(self.handles))

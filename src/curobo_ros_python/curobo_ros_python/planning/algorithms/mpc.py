@@ -26,21 +26,11 @@ from curobo_ros_python.planning.algorithms.common import (
     robot_cfg_with_locked_joints,
     squeeze_pose,
 )
-from curobo_ros_python.planning.groups import LYCUS_LEFT, LYCUS_RIGHT, both_arm_ee_links
+from curobo_ros_python.planning.groups import both_arm_ee_links
+from curobo_ros_python.planning.robot_profile import robot_profile
 from curobo_ros_python.planning.gripper import GripperStateUpdater, MeasuredPostureUpdater
 from curobo_ros_python.planning.motion_collision import configure_motion_collisions, install_motion_collision
 
-# 左臂 7 关节再右臂 7 关节，与 lycus cspace 顺序一致。躯干不在表里，仍用默认 0。
-# 肘在上，肩离限位留余量，腕关节放在 0，避免 joint_5 顶到 ±3.107。
-_L_POSTURE = {
-    **dict(zip(LYCUS_LEFT, (0.0, 1.20, -1.20, 1.40, 0.0, 0.0, 0.0))),
-    **dict(zip(LYCUS_RIGHT, (0.0, 1.20, 1.20, 1.40, 0.0, 0.0, 0.0))),
-}
-_ZERO_POSTURE = dict.fromkeys(_L_POSTURE, 0.0)
-_POSTURE_TABLES = {
-    "l": _L_POSTURE,
-    "zero": _ZERO_POSTURE,
-}
 
 def _rotvec_wxyz(q_from: torch.Tensor, q_to: torch.Tensor) -> torch.Tensor:
     """q_from 转到 q_to 的旋转向量，四元数 wxyz。"""
@@ -142,6 +132,7 @@ class DualArmMpc:
         self._posture_limits = {}
         self._posture_log_at = float("-inf")
         self._posture_kin = None
+        self._posture_tables = robot_profile(robot).posture_tables
         self._posture_q = None
         self._posture_js = None
         self._warn_at: Dict[str, float] = {}
@@ -233,7 +224,7 @@ class DualArmMpc:
     def update_gripper_state(self, joint_map: Dict[str, float]) -> None:
         """每拍按实测躯干、头部和夹爪原地更新几何；不重建 MPC 或重新预热。"""
         models = [self.mpc.kinematics]
-        posture_kin = getattr(self, "_posture_kin", None)
+        posture_kin = self._posture_kin
         if posture_kin is not None:
             models.append(posture_kin)
         # run_ik 模式使用独立 IK 求解器，也必须看到当前夹爪几何。
@@ -503,13 +494,13 @@ class DualArmMpc:
     def set_posture(self, name: str) -> None:
         """在 l 和 zero 之间切换零空间收拢目标。同名重复调用不做事。"""
         key = str(name or "l").strip().lower()
-        if key not in _POSTURE_TABLES:
+        if key not in self._posture_tables:
             self._warn_throttled(
                 "posture_name",
-                f"未知构型 {name!r}，可选 {sorted(_POSTURE_TABLES)}，仍用 {self.posture_name}",
+                f"未知构型 {name!r}，可选 {sorted(self._posture_tables)}，仍用 {self.posture_name}",
             )
             return
-        if key == self.posture_name and getattr(self, "_posture_ready", False):
+        if key == self.posture_name and self._posture_ready:
             return
         self.posture_name = key
         self._posture_ready = True
@@ -520,7 +511,7 @@ class DualArmMpc:
         key = (self.posture_name, tuple(self.joint_names), q.device, q.dtype, q.numel())
         target = self._posture_targets.get(key)
         if target is None:
-            table = _POSTURE_TABLES[self.posture_name]
+            table = self._posture_tables[self.posture_name]
             defaults = self.default_joint_position.detach().reshape(-1).cpu().tolist()
             if len(defaults) != q.numel():
                 defaults = [0.0] * q.numel()

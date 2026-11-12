@@ -12,8 +12,7 @@ import torch
 
 from curobo.config_io import join_path, load_yaml
 from curobo.content import get_assets_path, get_robot_configs_path
-
-GRIPPER_JOINTS = ("left_gripper", "right_gripper")
+from curobo_ros_python.planning.robot_profile import robot_profile
 
 
 _LOCK_FIELDS = ("position", "velocity", "acceleration", "jerk")
@@ -81,9 +80,9 @@ def _rotation(rpy: Sequence[float]) -> torch.Tensor:
 class GripperStateUpdater:
     """原地更新固定变换，保留求解器维数和 CUDA Graph 使用的张量地址。"""
 
-    def __init__(self, urdf_path: str):
+    def __init__(self, urdf_path: str, joint_names: Sequence[str] = ()):
         joints = {j.get("name"): j for j in ET.parse(urdf_path).getroot().findall("joint")}
-        self.joint_names = tuple(name for name in GRIPPER_JOINTS if name in joints)
+        self.joint_names = tuple(name for name in joint_names if name in joints)
         self._limits = {}
         self._velocity_limits = {}
         self._fingers = []
@@ -136,7 +135,10 @@ class GripperStateUpdater:
     def from_robot(cls, robot: str) -> GripperStateUpdater:
         data = load_yaml(join_path(str(get_robot_configs_path()), robot))
         path = data["robot_cfg"]["kinematics"]["urdf_path"]
-        return cls(join_path(str(get_assets_path()), path))
+        names = robot_profile(robot).gripper_joints
+        if cls is not GripperStateUpdater:
+            names = robot_profile(robot).posture_joints
+        return cls(join_path(str(get_assets_path()), path), names)
 
     def update(self, values: Mapping[str, float], models: Sequence[Any]) -> bool:
         """使用实测关节位置更新所有 FK/碰撞副本；缺失反馈时拒绝使用默认开合。"""
@@ -199,13 +201,13 @@ class GripperStateUpdater:
 
 class MeasuredPostureUpdater(GripperStateUpdater):
     """Keep measured torso/head geometry fixed during arm-only optimization."""
-    NAMES = ('Calf_joint', 'Thigh_joint', 'Waist_joint', 'Chest_joint', 'Neck_joint', 'Head_joint')
 
-    def __init__(self, urdf_path: str):
+    def __init__(self, urdf_path: str, joint_names: Sequence[str] = ()):
         joints = {j.get('name'): j for j in ET.parse(urdf_path).getroot().findall('joint')}
-        self.joint_names = tuple(name for name in self.NAMES if name in joints)
+        self.joint_names = tuple(name for name in joint_names if name in joints)
         self._limits, self._fingers, self._bindings = {}, [], {}
         self._previous = None
+        self._model_signature = None
         for name in self.joint_names:
             joint = joints[name]
             if joint.get('type') != 'revolute':

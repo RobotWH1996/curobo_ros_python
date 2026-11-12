@@ -1,0 +1,59 @@
+# Lycus 的机器人相关名字。关节顺序与 FollowJointTrajectory 控制器一致。
+robot_id: lycus
+left_joints:
+  - AR5-5_08L-W4C1C5-ZY2_joint_1
+  - AR5-5_08L-W4C1C5-ZY2_joint_2
+  - AR5-5_08L-W4C1C5-ZY2_joint_3
+  - AR5-5_08L-W4C1C5-ZY2_joint_4
+  - AR5-5_08L-W4C1C5-ZY2_joint_5
+  - AR5-5_08L-W4C1C5-ZY2_joint_6
+  - AR5-5_08L-W4C1C5-ZY2_joint_7
+right_joints:
+  - AR5-5_08R-W4C1C5-ZY2_joint_1
+  - AR5-5_08R-W4C1C5-ZY2_joint_2
+  - AR5-5_08R-W4C1C5-ZY2_joint_3
+  - AR5-5_08R-W4C1C5-ZY2_joint_4
+  - AR5-5_08R-W4C1C5-ZY2_joint_5
+  - AR5-5_08R-W4C1C5-ZY2_joint_6
+  - AR5-5_08R-W4C1C5-ZY2_joint_7
+ee_links:
+  left_arm: left_arm_ee_link
+  right_arm: right_arm_ee_link
+# 末端连杆名到该臂关节名前缀，用于按末端反查关节。
+ee_joint_prefix:
+  left_arm_ee_link: AR5-5_08L-
+  right_arm_ee_link: AR5-5_08R-
+gripper_joints:
+  left_arm: left_gripper
+  right_arm: right_gripper
+gripper_controllers:
+  left_gripper: /left_gripper_controller/follow_joint_trajectory
+  right_gripper: /right_gripper_controller/follow_joint_trajectory
+# 只随反馈更新几何、不参与优化的躯干和头部关节。
+posture_joints: [Calf_joint, Thigh_joint, Waist_joint, Chest_joint, Neck_joint, Head_joint]
+# {side} 替换为 left / right。
+gripper_base_link: "{side}_gripper_base"
+jaw_links: ["{side}_gripper_left_jaw", "{side}_gripper_right_jaw"]
+# 本包预留的携物连杆。{group} 替换为 left_arm / right_arm。
+payload_link: "pick_place_{group}_payload"
+fcl_self_collision: lycus_fcl_collision.yaml
+camera_parent_frame: camera_01_link
+camera_optical_frame: camera_01_color_optical_frame
+# MPC 零空间收拢目标，弧度。zero 构型由加载器对这里每个关节取 0。
+# 肘在上，肩离限位留余量，腕关节放在 0，避免 joint_5 顶到限位。
+posture_goals:
+  l:
+    AR5-5_08L-W4C1C5-ZY2_joint_1: 0.0
+    AR5-5_08L-W4C1C5-ZY2_joint_2: 1.20
+    AR5-5_08L-W4C1C5-ZY2_joint_3: -1.20
+    AR5-5_08L-W4C1C5-ZY2_joint_4: 1.40
+    AR5-5_08L-W4C1C5-ZY2_joint_5: 0.0
+    AR5-5_08L-W4C1C5-ZY2_joint_6: 0.0
+    AR5-5_08L-W4C1C5-ZY2_joint_7: 0.0
+    AR5-5_08R-W4C1C5-ZY2_joint_1: 0.0
+    AR5-5_08R-W4C1C5-ZY2_joint_2: 1.20
+    AR5-5_08R-W4C1C5-ZY2_joint_3: 1.20
+    AR5-5_08R-W4C1C5-ZY2_joint_4: 1.40
+    AR5-5_08R-W4C1C5-ZY2_joint_5: 0.0
+    AR5-5_08R-W4C1C5-ZY2_joint_6: 0.0
+    AR5-5_08R-W4C1C5-ZY2_joint_7: 0.0

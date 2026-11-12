@@ -68,7 +68,7 @@ curobo_motion_planning_node:
     pointcloud_exclude_boxes: " "  # 仿真 bag 里固定夹爪，xmin,ymin,zmin,xmax,ymax,zmax，base_link
     require_pointcloud: false           # true：没有点云/TF 则规划失败；false：告警后按空场景
     pointcloud_parent_frame: base_link  # 点云变到此系再进规划（应与 base_frame 一致）
-    pointcloud_child_frame: camera_01_color_optical_frame  # 点云所在光学系；空则用消息 header.frame_id
+    pointcloud_child_frame: auto       # auto 读机器人光学系，未配置或显式留空则用消息 header.frame_id
 
     # --- MPC（/follow_mpc 期间生效）---
     mpc_prewarm: false                   # 启动时各模式预热一次，不等点云；之后不再重建

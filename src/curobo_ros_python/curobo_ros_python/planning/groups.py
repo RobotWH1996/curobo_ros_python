@@ -1,7 +1,7 @@
 """规划组、关节顺序和控制器名称。
 
 关节顺序与 FollowJointTrajectory 控制器一致，也是服务请求里每个路点
-`positions` 的约定顺序。
+`positions` 的约定顺序。关节名、末端连杆和前缀来自 config/robots/*.yaml。
 
 由 ``apply_robot(robot_yaml)`` 按 ``robot`` 参数切换（规划节点启动时调用）。
 当前支持 ``k100.yml`` / ``lycus.yml``。
@@ -12,43 +12,23 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional, Tuple
 
-K100_LEFT = [
-    "left_shoulder_pitch_joint",
-    "left_shoulder_roll_joint",
-    "left_shoulder_yaw_joint",
-    "left_elbow_joint",
-    "left_wrist_roll_joint",
-    "left_wrist_pitch_joint",
-    "left_wrist_yaw_joint",
-]
-K100_RIGHT = [
-    "right_shoulder_pitch_joint",
-    "right_shoulder_roll_joint",
-    "right_shoulder_yaw_joint",
-    "right_elbow_joint",
-    "right_wrist_roll_joint",
-    "right_wrist_pitch_joint",
-    "right_wrist_yaw_joint",
-]
+from curobo_ros_python.planning.robot_profile import profiles
 
-LYCUS_LEFT = [
-    "AR5-5_08L-W4C1C5-ZY2_joint_1",
-    "AR5-5_08L-W4C1C5-ZY2_joint_2",
-    "AR5-5_08L-W4C1C5-ZY2_joint_3",
-    "AR5-5_08L-W4C1C5-ZY2_joint_4",
-    "AR5-5_08L-W4C1C5-ZY2_joint_5",
-    "AR5-5_08L-W4C1C5-ZY2_joint_6",
-    "AR5-5_08L-W4C1C5-ZY2_joint_7",
-]
-LYCUS_RIGHT = [
-    "AR5-5_08R-W4C1C5-ZY2_joint_1",
-    "AR5-5_08R-W4C1C5-ZY2_joint_2",
-    "AR5-5_08R-W4C1C5-ZY2_joint_3",
-    "AR5-5_08R-W4C1C5-ZY2_joint_4",
-    "AR5-5_08R-W4C1C5-ZY2_joint_5",
-    "AR5-5_08R-W4C1C5-ZY2_joint_6",
-    "AR5-5_08R-W4C1C5-ZY2_joint_7",
-]
+_ROBOTS: Dict[str, Dict[str, object]] = {
+    robot_id: {
+        "left": list(profile.left_joints),
+        "right": list(profile.right_joints),
+        "ee_prefix": dict(profile.ee_joint_prefix),
+        "ee_links": dict(profile.ee_links),
+    }
+    for robot_id, profile in profiles().items()
+}
+
+# 旧代码按这两个名字引用。内容与 config/robots 里的关节列表相同。
+LYCUS_LEFT = list(_ROBOTS["lycus"]["left"])
+LYCUS_RIGHT = list(_ROBOTS["lycus"]["right"])
+K100_LEFT = list(_ROBOTS["k100"]["left"])
+K100_RIGHT = list(_ROBOTS["k100"]["right"])
 
 _CONTROLLER_SWITCH = {
     "both_arms": (
@@ -63,25 +43,6 @@ _CONTROLLER_SWITCH = {
         ["left_arm_controller", "right_arm_controller"],
         ["both_arms_controller"],
     ),
-}
-
-_ROBOTS: Dict[str, Dict[str, object]] = {
-    "k100": {
-        "left": K100_LEFT,
-        "right": K100_RIGHT,
-        "ee_prefix": {
-            "left_arm_ee_link": "left_",
-            "right_arm_ee_link": "right_",
-        },
-    },
-    "lycus": {
-        "left": LYCUS_LEFT,
-        "right": LYCUS_RIGHT,
-        "ee_prefix": {
-            "left_arm_ee_link": "AR5-5_08L-",
-            "right_arm_ee_link": "AR5-5_08R-",
-        },
-    },
 }
 
 GROUP_JOINTS: Dict[str, List[str]] = {}
@@ -125,6 +86,7 @@ def apply_robot(robot: str) -> str:
     left = list(profile["left"])
     right = list(profile["right"])
     ee_prefix = dict(profile["ee_prefix"])
+    ee_links = dict(profile["ee_links"])
     ACTIVE_ROBOT = robot_id
 
     GROUP_JOINTS.clear()
@@ -136,9 +98,7 @@ def apply_robot(robot: str) -> str:
         }
     )
     GROUP_EE_LINK.clear()
-    GROUP_EE_LINK.update(
-        {"left_arm": "left_arm_ee_link", "right_arm": "right_arm_ee_link"}
-    )
+    GROUP_EE_LINK.update(ee_links)
     EE_TO_ARM_PREFIX.clear()
     EE_TO_ARM_PREFIX.update(ee_prefix)
     GROUP_ACTION.clear()
@@ -154,12 +114,7 @@ def apply_robot(robot: str) -> str:
         {k: (list(a), list(d)) for k, (a, d) in _CONTROLLER_SWITCH.items()}
     )
     _EE_JOINTS.clear()
-    _EE_JOINTS.update(
-        {
-            "left_arm_ee_link": left,
-            "right_arm_ee_link": right,
-        }
-    )
+    _EE_JOINTS.update({ee_links["left_arm"]: left, ee_links["right_arm"]: right})
     SUPPORTED_GROUPS = tuple(GROUP_JOINTS.keys())
     return ACTIVE_ROBOT
 

@@ -37,7 +37,7 @@ class MeshSelfFilter:
             selected = copy.copy(checker)
             selected.names = [checker.names[i] for i in indices]
             selected.meshes = [checker.meshes[i] for i in indices]
-            models = getattr(checker, 'mesh_models', None)
+            models = checker.mesh_models
             selected.mesh_models = [models[i] for i in indices] if models else []
             # FK still needs ancestors (e.g. torso), but never the other arm.
             by_child = {j.find('child').get('link'): j for j in checker.ordered}
@@ -66,7 +66,7 @@ class MeshSelfFilter:
             if key not in vertex_tree_cache:
                 vertex_tree_cache[key] = cKDTree(np.asarray(mesh.vertices))
             self.vertex_trees.append(vertex_tree_cache[key])
-        models = getattr(checker, 'mesh_models', None)
+        models = checker.mesh_models
         if not models:
             models = []
             for mesh in self.meshes:

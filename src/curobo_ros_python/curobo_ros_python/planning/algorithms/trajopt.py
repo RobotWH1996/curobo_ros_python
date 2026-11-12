@@ -404,7 +404,11 @@ class CuroboPlanner:
             f"interpolation_steps={interpolation_steps}"
         )
         urdf_joints = _urdf_joint_table(self._urdf_path(robot))
-        self._gripper_state = GripperStateUpdater(self._urdf_path(robot))
+        from curobo_ros_python.planning.robot_profile import robot_profile
+
+        self._gripper_state = GripperStateUpdater(
+            self._urdf_path(robot), robot_profile(robot).gripper_joints
+        )
         self._fixed_state = FixedJointStateUpdater.from_robot(
             robot, list(GROUP_JOINTS['both_arms']) + list(self._gripper_state.joint_names))
         self._planners: Dict[str, MotionPlanner] = {}
@@ -419,6 +423,8 @@ class CuroboPlanner:
         self._cloud_loaded: Dict[str, Any] = {}
         self._locked_pose: Dict[str, Dict[str, float]] = {}
         self.last_timing: Dict[str, float] = {}
+        self._placed_objects: Dict[str, Any] = {}
+        self._fcl_candidate_ms = 0.0
         self._info(f"OPT 启动预热: groups={list(warmup_groups)} iterations={warmup_iterations}")
         for group_name in _PLAN_GROUPS:
             idle = _idle_arm_joints(group_name)
@@ -473,18 +479,18 @@ class CuroboPlanner:
         try:
             return self._mesh_checker.check(values)
         finally:
-            self._fcl_candidate_ms = getattr(self, '_fcl_candidate_ms', 0.0) + (time.perf_counter() - started) * 1000
+            self._fcl_candidate_ms = self._fcl_candidate_ms + (time.perf_counter() - started) * 1000
 
     def _fcl_environment_label(self) -> str:
         count = len(self._mesh_checker.environment)
         return f"mesh障碍={count}" if count else "空场景（未检查环境障碍）"
 
     def _report_mesh_candidates(self, checked: int, rejected: Sequence[MeshCollision]) -> None:
-        if getattr(self._mesh_checker, "skip_fcl_checks", False):
+        if self._mesh_checker.skip_fcl_checks:
             self._fcl_candidate_ms = 0.0
             self.last_fcl_candidates = {}
             return
-        elapsed_ms = getattr(self, '_fcl_candidate_ms', 0.0)
+        elapsed_ms = self._fcl_candidate_ms
         self._fcl_candidate_ms = 0.0
         self.last_fcl_candidates = {"checked": checked, "rejected": len(rejected), "elapsed_ms": elapsed_ms}
         self._info(f"FCL IK筛选: 检查={checked}, 通过={checked - len(rejected)}, "
@@ -494,11 +500,11 @@ class CuroboPlanner:
                    (f"; 首个碰撞={rejected[0].kind}: {rejected[0].first} / {rejected[0].second}" if rejected else ""))
 
     def _check_mesh_endpoint(self, state: JointState, label: str = "目标点") -> Optional[str]:
-        if getattr(self._mesh_checker, "skip_fcl_checks", False):
+        if self._mesh_checker.skip_fcl_checks:
             return None
         started = time.perf_counter()
         row = state.position.reshape(-1, state.position.shape[-1])[-1].detach().cpu().tolist()
-        previous_ms = getattr(self, '_fcl_candidate_ms', 0.0)
+        previous_ms = self._fcl_candidate_ms
         try:
             hit = self._check_mesh_candidate(dict(zip(state.joint_names, row)))
         except Exception as exc:
@@ -626,7 +632,7 @@ class CuroboPlanner:
             raise ValueError('本体过滤后为空且配置了静态场景，拒绝清空混合环境')
         targets = [group_name] if group_name in self._planners else list(self._planners)
         for group in targets:
-            scene = SceneCfg(cuboid=list(getattr(self, "_placed_objects", {}).values()))
+            scene = SceneCfg(cuboid=list(self._placed_objects.values()))
             self._planners[group].update_world(scene)
             self._mesh_scenes[group] = self._mesh_checker.prepare_scene(scene)
             self._cloud_loaded.pop(group, None)
@@ -665,7 +671,7 @@ class CuroboPlanner:
         if self._cloud_fcl_sig != (sig, mesh_name):
             fcl_mesh = Mesh(name=mesh_name, pose=[0., 0., 0., 1., 0., 0., 0.],
                             vertices=self._cloud_vertices, faces=self._cloud_faces)
-            fcl_scene = self._mesh_checker.prepare_scene(SceneCfg(mesh=[fcl_mesh], cuboid=list(getattr(self, "_placed_objects", {}).values())))
+            fcl_scene = self._mesh_checker.prepare_scene(SceneCfg(mesh=[fcl_mesh], cuboid=list(self._placed_objects.values())))
             self._cloud_fcl_scene = fcl_scene
             self._cloud_fcl_sig = (sig, mesh_name)
         fcl_scene = self._cloud_fcl_scene
@@ -680,7 +686,7 @@ class CuroboPlanner:
             checker = motion.scene_collision_checker
             old = pop_cached_mesh(checker, mesh.name)
             try:
-                motion.update_world(SceneCfg(mesh=[mesh], cuboid=list(getattr(self, "_placed_objects", {}).values())))
+                motion.update_world(SceneCfg(mesh=[mesh], cuboid=list(self._placed_objects.values())))
             except Exception:
                 restore_cached_mesh(checker, mesh.name, old)
                 raise
@@ -778,7 +784,7 @@ class CuroboPlanner:
             print("WARN:", msg, flush=True)
 
     def _collision_hit(self, state: Optional[JointState]) -> Optional[MeshCollision]:
-        if state is None or getattr(self._mesh_checker, "skip_fcl_checks", False):
+        if state is None or self._mesh_checker.skip_fcl_checks:
             return None
         position = state.position.detach().reshape(-1, state.position.shape[-1])[-1].cpu().tolist()
         names = list(state.joint_names or [])
@@ -844,9 +850,9 @@ class CuroboPlanner:
         n_goals: int = 1,
     ) -> str:
         """失败时补充碰撞发生在初始点、路点还是目标点，以及相撞的两侧。"""
-        if getattr(self._mesh_checker, "skip_fcl_checks", False):
+        if self._mesh_checker.skip_fcl_checks:
             return message
-        previous_ms = getattr(self, "_fcl_candidate_ms", 0.0)
+        previous_ms = self._fcl_candidate_ms
         try:
             notes: List[str] = []
             checked = set()
@@ -898,7 +904,7 @@ class CuroboPlanner:
         return message
 
     def _fail(self, message: str) -> TrajResult:
-        candidates = getattr(self, "last_fcl_candidates", {})
+        candidates = self.last_fcl_candidates
         if candidates.get("checked", 0) and candidates.get("checked") == candidates.get("rejected"):
             message += "；FCL 已剔除全部 IK 候选（目标状态自碰撞或环境碰撞）"
         return TrajResult(False, message)

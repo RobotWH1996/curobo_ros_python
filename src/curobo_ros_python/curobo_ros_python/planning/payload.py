@@ -54,11 +54,15 @@ class Payload:
 
     @property
     def tool(self):
-        return self.group+'_ee_link'
+        from curobo_ros_python.planning.robot_profile import active_profile
+
+        return active_profile().ee_link_name(self.group)
 
     @property
     def link(self):
-        return 'pick_place_'+self.group+'_payload'
+        from curobo_ros_python.planning.robot_profile import active_profile
+
+        return active_profile().payload_link_name(self.group)
 
     def spheres(self):
         # 27 circumscribed cells cover the whole box, not just its surface.
@@ -70,25 +74,28 @@ class Payload:
 
 def configure_payload_links(robot):
     """Reserve inactive sphere slots on both tools before CUDA graph capture."""
+    from curobo_ros_python.planning.robot_profile import active_profile
+
+    profile = active_profile()
     kin=robot['robot_cfg']['kinematics']
-    # Leave other robot configurations untouched unless they expose this
-    # project's two modeled gripper assemblies.
-    if not {'left_gripper_base','right_gripper_base'}.issubset(kin.get('collision_link_names',[])):
+    # A robot without modeled gripper jaws (K100's hands) keeps its own config.
+    bases = {profile.gripper_base_name(side) for side in ('left', 'right')}
+    if not profile.jaw_links or not bases.issubset(kin.get('collision_link_names',[])):
         return robot
     links=kin.setdefault('extra_links',{})
     spheres=kin.setdefault('extra_collision_spheres',{})
     ignored=kin.setdefault('self_collision_ignore',{})
     for group in ('left_arm','right_arm'):
-        tool=group+'_ee_link'
+        tool = profile.ee_link_name(group)
         if tool not in kin.get('tool_frames',[]):
             continue
-        name='pick_place_'+group+'_payload'
+        name = profile.payload_link_name(group)
         links[name]=dict(link_name=name,parent_link_name=tool,joint_name=name+'_joint',
                          joint_type='FIXED',fixed_transform=[0,0,0,1,0,0,0])
         spheres[name]=27
         if name not in kin['collision_link_names']: kin['collision_link_names'].append(name)
         side=group.split('_')[0]
-        contacts=[tool,side+'_gripper_base',side+'_gripper_left_jaw',side+'_gripper_right_jaw']
+        contacts=[tool, profile.gripper_base_name(side), *profile.jaw_link_names(side)]
         # Payload touches fingers/tool by design, not proximal arm links.
         ignored[name]=list(dict.fromkeys(contacts))
         for link in contacts:

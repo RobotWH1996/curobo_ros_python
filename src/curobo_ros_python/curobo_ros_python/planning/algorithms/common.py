@@ -13,7 +13,7 @@ from curobo.types import Pose
 
 from curobo_ros_python.planning.geom import quat_angle_wxyz
 from curobo_ros_python.planning.groups import GROUP_JOINTS
-from curobo_ros_python.planning.gripper import GRIPPER_JOINTS
+from curobo_ros_python.planning.robot_profile import robot_profile
 
 
 def squeeze_pose(pose: Pose) -> Pose:
@@ -65,7 +65,7 @@ def robot_cfg_with_locked_joints(
         return data, {}
     defaults = list(cspace.get("default_joint_position") or [])
     locks = dict(kinematics.get("lock_joints") or {})
-    for name in GRIPPER_JOINTS:
+    for name in robot_profile(robot).gripper_joints:
         if name in all_names:
             locks[name] = float((current or {}).get(name, locks.get(name, 0.0)))
     for i, name in enumerate(all_names):
