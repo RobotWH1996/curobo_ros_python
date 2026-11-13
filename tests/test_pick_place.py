@@ -9,8 +9,10 @@ import torch
 import yaml
 from rosidl_runtime_py.set_message import set_message_fields
 from rclpy.action import GoalResponse
+from curobo.types import JointState
 from curobo_ros_interfaces.action import Pick, Place, PickPlace
 from curobo_ros_python.motion_planning_node import CuroboMotionPlanningNode, _PARAM_DEFAULTS
+from curobo_ros_python.planning.curobo_adapter import expand_joint_trajectory
 from curobo_ros_python.planning.groups import apply_robot
 from curobo_ros_python.planning.manipulation import ManipulationWorkflow
 from curobo_ros_python.planning.payload import Payload
@@ -97,6 +99,22 @@ class GeometryAndWorkflowTests(unittest.TestCase):
         goal.pick.end_pose.joint_positions = [float('nan')]*7
         with self.assertRaises(ValueError):
             backend.validate_pick(goal.pick)
+
+    def test_fast_trajectory_export_preserves_order_and_holds_inactive_joints(self):
+        trajectory = JointState.from_position(
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]]), joint_names=["second", "first"]
+        )
+        trajectory.velocity = torch.tensor([[0.1, 0.2], [0.3, 0.4]])
+        trajectory.acceleration = None
+        trajectory.dt = torch.tensor([0.02])
+        expanded = expand_joint_trajectory(
+            trajectory, {"jaw": -0.025}, ["first", "jaw", "second"]
+        )
+        self.assertEqual(expanded.joint_names, ["first", "jaw", "second"])
+        torch.testing.assert_close(expanded.position, torch.tensor([[2., -.025, 1.], [4., -.025, 3.]]))
+        torch.testing.assert_close(expanded.velocity, torch.tensor([[.2, 0., .1], [.4, 0., .3]]))
+        torch.testing.assert_close(expanded.dt, trajectory.dt)
+        self.assertIsNone(expanded.acceleration)
 
     def test_payload_updates_preserve_addresses(self):
         spheres = torch.zeros((1, 54, 4))

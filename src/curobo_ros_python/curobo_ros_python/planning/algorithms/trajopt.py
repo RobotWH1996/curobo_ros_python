@@ -15,7 +15,7 @@ import torch
 
 from curobo.config_io import join_path, load_yaml
 from curobo.content import get_assets_path, get_task_configs_path
-from curobo.motion_planner import MotionPlanner, MotionPlannerCfg, format_ik_failure, format_plan_failure
+from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
 from curobo.types import GoalToolPose, JointState, Pose
 
 from curobo_ros_python.planning.algorithms.common import (
@@ -24,6 +24,7 @@ from curobo_ros_python.planning.algorithms.common import (
     robot_cfg_with_locked_joints,
     squeeze_pose,
 )
+from curobo_ros_python.planning.curobo_adapter import last_ik_result, set_last_ik_result
 from curobo_ros_python.planning.groups import (
     GROUP_JOINTS,
     apply_robot,
@@ -57,6 +58,23 @@ _COLLISION_KIND = {
     "payload_self": "携物自碰撞",
     "payload_environment": "携物环境碰撞",
 }
+
+
+def _solver_failure(result, name: str) -> str:
+    if result is None:
+        return f"{name} 未找到可行解"
+    feasible = getattr(result, "feasible", None)
+    details = []
+    if feasible is not None:
+        details.append("末端未达标或未收敛" if feasible.any() else "存在碰撞或超过关节限位")
+    for field, label, scale, unit in (
+        ("position_error", "位置误差", 1000.0, "mm"),
+        ("rotation_error", "姿态误差", 180.0 / math.pi, "deg"),
+    ):
+        error = getattr(result, field, None)
+        if error is not None and error.numel():
+            details.append(f"{label}最小 {float(error.amin()) * scale:.2f} {unit}")
+    return f"{name} 失败" + ("；" + "；".join(details) if details else "")
 
 
 def waypoint_collision_label(index: int, count: int) -> str:
@@ -556,9 +574,10 @@ class CuroboPlanner:
             position_tolerance=self._position_tolerance,
             orientation_tolerance=self._orientation_tolerance,
             num_trajopt_seeds=self._seeds,
-            trajopt_num_iters=self._iters,
             trajopt_transition_model=transition,
         )
+        cfg.trajopt_solver_config.initial_max_iters = self._iters
+        cfg.trajopt_solver_config.initial_check_interval = self._iters
         motion = MotionPlanner(cfg)
         install_motion_collision(motion, moving)
         install_vertical_cost(motion)
@@ -882,7 +901,7 @@ class CuroboPlanner:
             rows, names = self._trajectory_rows(result)
             if rows is None and result is None:
                 motion = self._motion or self.planner
-                record(f"{end}的IK候选", self._ik_collision_state(motion, getattr(motion, "last_ik_result", None)))
+                record(f"{end}的IK候选", self._ik_collision_state(motion, last_ik_result(motion.ik_solver)))
             if rows is not None:
                 total = int(rows.shape[0])
                 for index in trajectory_sample_indices(total):
@@ -1058,9 +1077,11 @@ class CuroboPlanner:
         hold_state: JointState,
         hold_joints: Sequence[str],
     ) -> TrajResult:
-        if result is None or not result.success.any():
+        if result is None or result.success is None or not result.success.any():
             motion = self._motion or self.planner
-            message = f"规划失败: {format_plan_failure(result, motion.last_ik_result)}"
+            ik = last_ik_result(motion.ik_solver) if result is None else None
+            detail = _solver_failure(ik, "IK") if ik is not None else _solver_failure(result, "TrajOpt")
+            message = f"规划失败: {detail}"
             return self._fail(self._with_collision_detail(message, result, hold_state))
         traj = result.get_interpolated_plan()
         if traj is None:
@@ -1148,6 +1169,7 @@ class CuroboPlanner:
                 current_fk = self.fk_tool_poses(current)
             goal, idle_joints = self._goal_for_ee_poses(current, pose_by_ee, current_fk=current_fk)
             goals.append(goal)
+        set_last_ik_result(motion.ik_solver, None)
         with vertical_tool_scope(motion,self.keep_tool_z_vertical,tuple(pose_by_ee),goal_poses=goals[-1]):
             if len(goals) == 1:
                 result = motion.plan_pose(
@@ -1196,6 +1218,7 @@ class CuroboPlanner:
         if collision_hits:
             return self._fail("规划失败: " + "；".join(collision_hits))
         frames=both_arm_ee_links() if group_name=='both_arms' else (resolve_ee_link(group_name,'')[0],)
+        set_last_ik_result(motion.ik_solver, None)
         with vertical_tool_scope(motion,self.keep_tool_z_vertical,frames,goal_state=goals[-1]):
             if len(goals) == 1:
                 result = motion.plan_cspace(
@@ -1238,7 +1261,7 @@ class CuroboPlanner:
             goal, current_state=active, return_seeds=1
         )
         if ik is None or not ik.success.any():
-            return self._fail(format_ik_failure(ik))
+            return self._fail(_solver_failure(ik, "IK"))
         return TrajResult(True, "IK 求解成功", solution=ik.js_solution)
 
 

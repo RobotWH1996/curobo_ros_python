@@ -39,7 +39,10 @@ from curobo_ros_python.planning.offline_trajectory import (
     sample_trajectory,
     ros_duration,
 )
-from curobo.trajectory_optimizer import expand_joint_trajectory
+from curobo_ros_python.planning.curobo_adapter import (
+    expand_joint_trajectory,
+    trajectory_is_collision_free,
+)
 from curobo_ros_python.planning.groups import GROUP_EE_LINK, GROUP_JOINTS
 from curobo_ros_python.planning.robot_profile import active_profile
 from curobo_ros_python.planning.trajectory import select_trajectory_joints
@@ -1062,7 +1065,7 @@ class TaskBackend(TaskGeometry):
                             context["world"] if context["world"] is not None else SceneCfg()
                         )
                     checker.environment = context["scene"]
-                    if not motion._joint_traj_is_collision_free(state):
+                    if not trajectory_is_collision_free(motion, state):
                         raise RuntimeError(f"{context['stage']} 合并后 GPU 碰撞验收失败")
                     for row in (positions[0], positions[-1]):
                         keypoint = dict(values)

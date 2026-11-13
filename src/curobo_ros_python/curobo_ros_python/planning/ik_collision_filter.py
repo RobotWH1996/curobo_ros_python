@@ -5,6 +5,8 @@ from functools import wraps
 from typing import Any, Callable
 import torch
 
+from curobo_ros_python.planning.curobo_adapter import replace_method, set_last_ik_result
+
 
 def install_ik_filter(solver: Any, check: Callable, report: Callable) -> None:
     """Apply CPU checks after IK, before MotionPlanner can use its seed output."""
@@ -13,6 +15,7 @@ def install_ik_filter(solver: Any, check: Callable, report: Callable) -> None:
     @wraps(original)
     def solve_pose(*args: Any, **kwargs: Any) -> Any:
         result = original(*args, **kwargs)
+        set_last_ik_result(solver, result)
         if result is None or result.solution is None:
             return result
         # Clone: solver outputs may reference buffers reused by CUDA graphs.
@@ -61,7 +64,5 @@ def install_ik_filter(solver: Any, check: Callable, report: Callable) -> None:
             result.js_solution = js
         report(checked, rejected)
         return result
-
-    from curobo_ros_python.planning.curobo_adapter import replace_method
 
     replace_method(solver, "solve_pose", solve_pose)
