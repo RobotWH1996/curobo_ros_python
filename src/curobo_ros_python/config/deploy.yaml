@@ -14,6 +14,7 @@ curobo_motion_planning_node:
     trajopt_num_seeds: 2                # 并行种子。关节目标各种子相同，1 最快；位姿目标失败多了再调回 4
     trajopt_finetune_attempts: 1        # 首解后再压时间的轮数。0 只求可行（最快），3 是 cuRobo 原默认（4 轮 L-BFGS）
     trajopt_num_iters: 50               # 每轮 L-BFGS 步数，必须是 25 的倍数。障碍里失败再调回 100
+    trajopt_graph_planner: rrt          # OPT 图搜索后端：rrt（GPU 双向 RRT）或 prm
     trajopt_interpolation_steps: 2      # OPT 内部 B 样条采样密度，1–32；原默认 4，输出间隔由 interpolation_dt 控制
     position_tolerance: 0.005           # 笛卡尔位置成功阈值 (m)，也用于中间笛卡尔路点验收
     orientation_tolerance: 0.05         # 笛卡尔姿态成功阈值 (rad)，也用于中间笛卡尔路点验收

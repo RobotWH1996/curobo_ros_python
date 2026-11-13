@@ -50,7 +50,6 @@ def configure_motion_collisions(robot: dict, active_joints: Iterable[str]) -> fr
 
 def install_motion_collision(owner, moving: frozenset[str]) -> None:
     """Mask only WORLD queries before CUDA capture; self-collision spheres stay intact."""
-    import torch
     pending = [owner]
     seen_owners = set()
     rollouts = []
@@ -67,6 +66,28 @@ def install_motion_collision(owner, moving: frozenset[str]) -> None:
             rollouts.extend(item.get_all_rollout_instances())
         pending.extend(getattr(item, name, None) for name in
                        ('ik_solver', 'trajopt_solver', 'seed_ik_solver', 'graph_planner'))
+    if not _scope_rollouts(rollouts, moving):
+        raise RuntimeError('No GPU scene collision costs available for motion scoping')
+
+    graph = getattr(owner, 'graph_planner', None)
+    if graph is not None and owner.config.graph_planner_algorithm == 'rrt':
+        from curobo_ros_python.planning.curobo_adapter import replace_method
+
+        create = graph._create_rollout
+
+        @wraps(create)
+        def scoped_create(*args, **kwargs):
+            rollout = create(*args, **kwargs)
+            if not _scope_rollouts((rollout,), moving):
+                raise RuntimeError('No GPU scene collision costs available for RRT')
+            return rollout
+
+        replace_method(graph, '_create_rollout', scoped_create)
+
+
+def _scope_rollouts(rollouts, moving: frozenset[str]) -> bool:
+    import torch
+
     from curobo_ros_python.planning.curobo_adapter import (
         collision_scope,
         replace_method,
@@ -74,7 +95,6 @@ def install_motion_collision(owner, moving: frozenset[str]) -> None:
     )
 
     seen = set()
-    costs = []
     for rollout in rollouts:
         model = rollout.transition_model.robot_model.config.kinematics_config
         flags = torch.zeros(model.num_links, device=model.link_sphere_idx_map.device, dtype=torch.bool)
@@ -106,6 +126,4 @@ def install_motion_collision(owner, moving: frozenset[str]) -> None:
 
             replace_method(cost, "forward", wraps(original)(scoped_forward))
             set_collision_scope(cost, moving)
-            costs.append(cost)
-    if not costs:
-        raise RuntimeError('No GPU scene collision costs available for motion scoping')
+    return bool(seen)

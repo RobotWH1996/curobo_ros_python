@@ -316,9 +316,9 @@ def _robot_models(planner: MotionPlanner) -> List[Any]:
             add(seed._robot_model)
     graph = planner.graph_planner
     if graph is not None:
-        add_rollout(getattr(graph, "feasibility_rollout", None))
-        add_rollout(getattr(graph, "auxiliary_rollout", None))
-        add(getattr(graph, "kinematics", None))
+        for rollout in graph.get_all_rollout_instances():
+            add_rollout(rollout)
+        add(graph.kinematics)
     return found
 
 
@@ -370,6 +370,7 @@ class CuroboPlanner:
         keep_tool_z_vertical: bool = False,
         trajopt_interpolation_steps: int = 2,
         warmup_groups: Optional[Sequence[str]] = None,
+        graph_planner_algorithm: str = "prm",
     ):
         self._log = logger
         warmup_groups = tuple(_PLAN_GROUPS if warmup_groups is None else dict.fromkeys(warmup_groups))
@@ -414,12 +415,15 @@ class CuroboPlanner:
         self._seeds = seeds
         self._iters = iters
         self._interpolation_steps = interpolation_steps
+        if graph_planner_algorithm not in {"prm", "rrt"}:
+            raise ValueError("trajopt_graph_planner 必须是 prm 或 rrt")
+        self._graph_planner_algorithm = graph_planner_algorithm
         self._joint_tol = joint_tol
         self._robot = robot
         self._info(f"加载 cuRobo 机器人配置: {robot}")
         self._info(
             f"TrajOpt: seeds={seeds}, finetune_attempts={finetune}, num_iters={iters}, "
-            f"interpolation_steps={interpolation_steps}"
+            f"interpolation_steps={interpolation_steps}, graph_planner={graph_planner_algorithm}"
         )
         urdf_joints = _urdf_joint_table(self._urdf_path(robot))
         from curobo_ros_python.planning.robot_profile import robot_profile
@@ -575,6 +579,7 @@ class CuroboPlanner:
             orientation_tolerance=self._orientation_tolerance,
             num_trajopt_seeds=self._seeds,
             trajopt_transition_model=transition,
+            graph_planner_algorithm=self._graph_planner_algorithm,
         )
         cfg.trajopt_solver_config.initial_max_iters = self._iters
         cfg.trajopt_solver_config.initial_check_interval = self._iters
@@ -636,7 +641,10 @@ class CuroboPlanner:
         _apply_locked_joints(self._models[group_name], specs, values)
         if motion.graph_planner is not None:
             motion.graph_planner.reset_buffer()
-            self._info(f"{group_name} 锁定手臂姿态已变化，PRM 缓存已清空")
+        self._info(
+            f"{group_name} 锁定手臂运动学已更新，"
+            f"graph_planner={self._graph_planner_algorithm}"
+        )
         self._locked_pose[group_name] = values
         return motion
 
@@ -1170,6 +1178,7 @@ class CuroboPlanner:
             goal, idle_joints = self._goal_for_ee_poses(current, pose_by_ee, current_fk=current_fk)
             goals.append(goal)
         set_last_ik_result(motion.ik_solver, None)
+        started = time.perf_counter()
         with vertical_tool_scope(motion,self.keep_tool_z_vertical,tuple(pose_by_ee),goal_poses=goals[-1]):
             if len(goals) == 1:
                 result = motion.plan_pose(
@@ -1185,7 +1194,7 @@ class CuroboPlanner:
                     max_attempts=max_attempts,
                     finetune_attempts=self._finetune_attempts,
                 )
-        self.last_timing = dict(getattr(motion, "last_timing", {}) or {})
+        self._record_plan_timing(motion, started)
         if len(goals) == 1:
             return self._from_single_result(result, current, idle_joints)
         return self._from_waypoint_result(result, current, idle_joints, len(goals))
@@ -1219,6 +1228,7 @@ class CuroboPlanner:
             return self._fail("规划失败: " + "；".join(collision_hits))
         frames=both_arm_ee_links() if group_name=='both_arms' else (resolve_ee_link(group_name,'')[0],)
         set_last_ik_result(motion.ik_solver, None)
+        started = time.perf_counter()
         with vertical_tool_scope(motion,self.keep_tool_z_vertical,frames,goal_state=goals[-1]):
             if len(goals) == 1:
                 result = motion.plan_cspace(
@@ -1234,12 +1244,22 @@ class CuroboPlanner:
                     max_attempts=max_attempts,
                     finetune_attempts=self._finetune_attempts,
                 )
-        self.last_timing = dict(getattr(motion, "last_timing", {}) or {})
+        self._record_plan_timing(motion, started)
         if len(goals) == 1:
             return self._from_single_result(result, current, hold_joints)
         return self._from_waypoint_result(
             result, current, hold_joints, len(goals)
         )
+
+    def _record_plan_timing(self, motion: MotionPlanner, started: float) -> None:
+        graph_calls = motion.last_graph_call_telemetry
+        self.last_timing = {
+            "solve": time.perf_counter() - started,
+            self._graph_planner_algorithm: motion.last_graph_time,
+            "graph_calls": len(graph_calls),
+            "graph_successes": sum(record.success for record in graph_calls),
+            "attempts": motion.last_planning_attempts,
+        }
 
     def compute_ik(
         self,

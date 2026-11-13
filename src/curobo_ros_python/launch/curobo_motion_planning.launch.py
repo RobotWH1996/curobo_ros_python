@@ -27,6 +27,7 @@ _OVERRIDE_ARGS = (
     ("trajopt_num_seeds", int, "TrajOpt 并行种子数；关节目标里各种子相同，1 最快"),
     ("trajopt_finetune_attempts", int, "首解之后的时间最优轮数；0 最快，3 为 cuRobo 原默认"),
     ("trajopt_num_iters", int, "每轮 L-BFGS 步数，必须是 25 的倍数"),
+    ("trajopt_graph_planner", None, "OPT 绕障搜索：prm 或 rrt"),
     ("use_cuda_graph", bool, None),
     ("joint_states_topic", None, None),
     ("base_frame", None, None),

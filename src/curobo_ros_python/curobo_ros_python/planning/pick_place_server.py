@@ -679,11 +679,15 @@ class TaskBackend(TaskGeometry):
         solved = time.monotonic()
         self.check()
         timing = self.p.last_timing
+        timings = " ".join(
+            f"{key}_ms={timing[key] * 1000:.2f}"
+            for key in ("solve", "ik", "prm", "rrt", "trajopt", "check") if key in timing
+        )
         self.log(
             "求解计时",
-            f"ik_ms={timing.get('ik', 0.0) * 1000:.1f} prm_ms={timing.get('prm', 0.0) * 1000:.1f} "
-            f"trajopt_ms={timing.get('trajopt', 0.0) * 1000:.1f} check_ms={timing.get('check', 0.0) * 1000:.1f} "
-            f"attempts={int(timing.get('attempts', 0))}",
+            f"{timings} attempts={int(timing.get('attempts', 0))} "
+            f"graph_calls={int(timing.get('graph_calls', 0))} "
+            f"graph_successes={int(timing.get('graph_successes', 0))}",
         )
         if not planned.success or planned.trajectory is None:
             raise RuntimeError(planned.message)

@@ -71,6 +71,7 @@ _PARAM_DEFAULTS: Dict[str, Any] = {
     "trajopt_finetune_attempts": 1,
     "trajopt_num_iters": 50,
     "trajopt_interpolation_steps": 2,
+    "trajopt_graph_planner": "prm",
     "position_tolerance": 0.005,
     "orientation_tolerance": 0.05,
     "waypoint_joint_tolerance": 0.1,
@@ -246,6 +247,7 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
             num_trajopt_seeds=int(self._p("trajopt_num_seeds")),
             trajopt_num_iters=int(self._p("trajopt_num_iters")),
             trajopt_interpolation_steps=int(self._p("trajopt_interpolation_steps")),
+            graph_planner_algorithm=str(self._p("trajopt_graph_planner")),
             finetune_attempts=int(self._p("trajopt_finetune_attempts")),
             logger=self.get_logger(),
             self_filter_geometry=str(self._p('self_filter_mode')) != 'off',
@@ -577,14 +579,19 @@ class CuroboMotionPlanningNode(SelfFilterMixin, Node):
         def ms(source: Dict[str, float], key: str) -> float:
             return float(source.get(key, 0.0)) * 1000.0
 
+        solver = " ".join(
+            f"{key}={ms(stages, key):.2f}ms"
+            for key in ("solve", "ik", "prm", "rrt", "trajopt", "check") if key in stages
+        )
+        graph = " ".join(
+            f"{key}={int(stages[key])}" for key in ("graph_calls", "graph_successes") if key in stages
+        )
         parts = (
             f"cloud={ms(world, 'cloud'):.0f}ms "
             f"scene={ms(world, 'scene'):.0f}ms "
-            f"ik={ms(stages, 'ik'):.0f}ms "
-            f"prm={ms(stages, 'prm'):.0f}ms "
-            f"trajopt={ms(stages, 'trajopt'):.0f}ms "
-            f"check={ms(stages, 'check'):.0f}ms "
+            f"{solver + ' ' if solver else ''}"
             f"attempts={int(stages.get('attempts', 0))} "
+            f"{graph + ' ' if graph else ''}"
             f"wall={timer.total_ms():.0f}ms"
         )
         return f"计时 {parts}"
